@@ -8,19 +8,27 @@ services:
     command: mongod --oplogSize 128
     volumes:
       - wekan-db-data:/data/db
+    networks:
+      - app-network
 
   wekan:
     image: quay.io/wekan/wekan:latest
     container_name: wekan-app
     restart: always
     ports:
-      - "8080:8080"
+      - "4000:8080"
     environment:
       - MONGO_URL=mongodb://wekan-db:27017/wekan
-      - ROOT_URL=http://localhost:8080
+      - ROOT_URL=http://localhost:4000
       - WITH_API=true
     depends_on:
       - wekan-db
+    networks:
+      - app-network
 
 volumes:
   wekan-db-data:
+
+networks:
+  app-network:
+    external: true

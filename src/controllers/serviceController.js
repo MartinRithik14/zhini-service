@@ -232,24 +232,31 @@ export const getNearbyHomeServices = async (c) => {
   try {
     // Read directly from body (with fallback for raw json or query)
     let body = {};
-    try { body = await c.req.json(); } catch (_) { body = await c.req.parseBody(); }
+    try { 
+      body = await c.req.json(); 
+    } catch (_) { 
+      body = await c.req.parseBody(); 
+    }
 
     const serviceType = (body.serviceType || body.category || c.req.query('serviceType') || '').trim();
     const pincode = (body.pincode || c.req.query('pincode') || '').trim();
-    const lat = body.latitude || body.lat || c.req.query('latitude') || c.req.query('lat') || null;
-    const lng = body.longitude || body.lng || c.req.query('longitude') || c.req.query('lng') || null;
+    const rawLat = body.latitude || body.lat || c.req.query('latitude') || c.req.query('lat') || null;
+    const rawLng = body.longitude || body.lng || c.req.query('longitude') || c.req.query('lng') || null;
 
-    // Build location query from pincode or lat/lng
-    const locationQuery = pincode || (lat && lng ? `${lat},${lng}` : null);
+    const lat = rawLat !== null && !isNaN(Number(rawLat)) ? Number(rawLat) : null;
+    const lng = rawLng !== null && !isNaN(Number(rawLng)) ? Number(rawLng) : null;
+    const hasCoordinates = lat !== null && lng !== null;
 
-    if (!serviceType || !locationQuery) {
+    if (!serviceType || (!pincode && !hasCoordinates)) {
       return c.json({
         success: false,
-        message: 'Both serviceType and a valid location (pincode or lat/lng) are required.'
+        message: 'serviceType and at least one location parameter (pincode or latitude/longitude) are required.'
       }, 400);
     }
 
-    const cacheKey = `home_service_${serviceType}_${locationQuery}`.toLowerCase().replace(/[^a-z0-9]/g, '');
+    // Generate unique cache key based on available location identifier
+    const locationKey = hasCoordinates ? `${lat.toFixed(4)}_${lng.toFixed(4)}` : pincode;
+    const cacheKey = `home_service_${serviceType}_${locationKey}`.toLowerCase().replace(/[^a-z0-9]/g, '');
 
     const servicesData = await withDatabase(mongoUri, async (db) => {
       const collection = db.collection('common_cache');
@@ -262,8 +269,8 @@ export const getNearbyHomeServices = async (c) => {
       }
 
       // 2. Fetch live local technicians
-      console.log(`🌐 Scraping live local services for "${serviceType}" in ${locationQuery}...`);
-      const freshData = await scrapeHomeServices(serviceType, locationQuery);
+      console.log(`🌐 Fetching live local services for "${serviceType}" at (${locationKey})...`);
+      const freshData = await scrapeHomeServices(serviceType, { pincode, lat, lng });
 
       const topServices = freshData
         .sort((a, b) => (parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0))

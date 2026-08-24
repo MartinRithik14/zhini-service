@@ -1,4 +1,7 @@
 node_modules
-npm-debug.log
-.env
 .git
+.gitignore
+*.tar
+*.log
+.env*
+.vscode

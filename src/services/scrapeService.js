@@ -61,15 +61,33 @@ export const scrapeServiceCenters = async (brand, product, pincode, options = { 
 };
 
 
-export const scrapeHomeServices = async (serviceType, pincode) => {
+export const scrapeHomeServices = async (serviceType, { pincode, lat, lng } = {}) => {
   try {
-    const searchQuery = `${serviceType} near ${pincode}`;
+    const hasCoordinates = lat !== null && lng !== null && !isNaN(lat) && !isNaN(lng);
+
+    // Construct payload for Google Places API (New)
+    const requestBody = {
+      textQuery: hasCoordinates 
+        ? `${serviceType} services` 
+        : `${serviceType} services in ${pincode}`
+    };
+
+    // If coordinates exist, bias results within a 15km radius of the user
+    if (hasCoordinates) {
+      requestBody.locationBias = {
+        circle: {
+          center: {
+            latitude: Number(lat),
+            longitude: Number(lng)
+          },
+          radius: 15000.0 // 15 km radius
+        }
+      };
+    }
 
     const response = await axios.post(
       "https://places.googleapis.com/v1/places:searchText",
-      {
-        textQuery: searchQuery,
-      },
+      requestBody,
       {
         headers: {
           "Content-Type": "application/json",

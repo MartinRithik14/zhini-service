@@ -13,7 +13,7 @@ const mongoUri = process.env.MONGODB_URI;
 export const createHome = async (c) => {
   try {
     const body = await c.req.json().catch(async () => await c.req.parseBody());
-    const { name, mobile, address, pincode } = body;
+    const { name, mobile, address, pincode, homeName } = body;
 
     if (!mobile) {
       return c.json({
@@ -23,8 +23,9 @@ export const createHome = async (c) => {
     }
 
     const cleanMobile = mobile.toString().trim();
-    const cleanAddress = (address || "Default Home").toString().trim();
-    const cleanName = (name || "Guest").toString().trim();
+    const cleanUserName = (name || "Guest").toString().trim();
+    const cleanHomeName = (homeName || "Default Home").toString().trim();
+    const cleanAddress = (address || "").toString().trim();
     const cleanPincode = (pincode || "").toString().trim();
 
     const numMobile = Number(cleanMobile);
@@ -35,7 +36,7 @@ export const createHome = async (c) => {
 
       const now = new Date().toISOString();
 
-      // 1. Upsert user by mobile
+      // 1. Upsert / Find user by mobile
       let userDoc = await usersCol.findOne({
         $or: [
           { mobile: cleanMobile },
@@ -46,31 +47,36 @@ export const createHome = async (c) => {
       if (!userDoc) {
         const insertRes = await usersCol.insertOne({
           mobile: cleanMobile,
-          name: cleanName,
+          name: cleanUserName,
           createdAt: now,
           updatedAt: now
         });
-        userDoc = { _id: insertRes.insertedId, mobile: cleanMobile, name: cleanName };
-      } else if (cleanName !== "Guest" && userDoc.name !== cleanName) {
+        userDoc = { _id: insertRes.insertedId, mobile: cleanMobile, name: cleanUserName };
+      } else if (cleanUserName !== "Guest" && userDoc.name !== cleanUserName) {
         await usersCol.updateOne(
           { _id: userDoc._id },
-          { $set: { name: cleanName, updatedAt: now } }
+          { $set: { name: cleanUserName, updatedAt: now } }
         );
       }
 
-      // 2. Check if this home already exists for the user
-      const existingHome = await homesCol.findOne({
-        ownerId: userDoc._id,
-        address: cleanAddress
-      });
+      // 2. Check duplicate ONLY if exact same address and homeName already exist for this user
+      let existingHome = null;
+      if (cleanAddress) {
+        existingHome = await homesCol.findOne({
+          ownerId: userDoc._id,
+          address: cleanAddress,
+          homeName: cleanHomeName
+        });
+      }
 
       if (existingHome) {
         return { homeId: existingHome._id.toString(), reused: true };
       }
 
-      // 3. Create new Home
+      // 3. Create distinct new Home (Allows user to have multiple homes)
       const homeInsert = await homesCol.insertOne({
         ownerId: userDoc._id,
+        homeName: cleanHomeName,
         address: cleanAddress,
         pincode: cleanPincode,
         members: [userDoc._id],
