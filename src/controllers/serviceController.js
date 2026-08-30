@@ -3,7 +3,7 @@ import { scrapeServiceCenters, scrapeHomeServices } from '../services/scrapeServ
 import 'dotenv/config';
 import { ObjectId } from "mongodb";
 import { uploadToR2 } from "../services/r2.service.js";
-import { createServiceCard, moveCardToList, createProviderBoard } from '../services/wekan.js';
+import { createServiceCard, moveCardToList, createProviderBoard,getWekanAuthHeaders } from '../services/wekan.js';
 
 const mongoUri = process.env.MONGODB_URI;
 const CACHE_EXPIRATION_MS = 24 * 60 * 60 * 1000; // 24 Hours in milliseconds
@@ -561,6 +561,8 @@ export const createServiceTicket = async (c) => {
 };
 
 
+
+
 export const getProviderTickets = async (c) => {
   try {
     let body = {};
@@ -607,6 +609,7 @@ const STATUS_TO_WEKAN_LIST = {
   "NEW": "New",
   "ACCEPTED": "Accepted",
   "REJECTED": "Rejected",
+  "CANCELED": "Canceled",
   "IN_PROGRESS": "In Progress",
   "WAITING_FOR_PARTS": "Waiting for Parts",
   "COMPLETED": "Completed"
@@ -697,6 +700,126 @@ export const updateTicketStatus = async (c) => {
     return c.json({
       success: false,
       message: "Failed to update ticket status",
+      error: error.message
+    }, 500);
+  }
+};
+
+export const cancelTicket = async (c) => {
+  try {
+    let body = {};
+    try {
+      body = await c.req.json();
+    } catch (_) {
+      body = await c.req.parseBody();
+    }
+
+    const { ticketId, customerMobile, reason } = body;
+
+    if (!ticketId) {
+      return c.json({
+        success: false,
+        message: "Missing required field: ticketId is required."
+      }, 400);
+    }
+
+    const cancelReason = (reason || "No cancellation reason provided.").trim();
+
+    const updatedTicket = await withDatabase(mongoUri, async (db) => {
+      const wekanServiceCollection = db.collection("wekan-services");
+      const providerCollection = db.collection("service-providers");
+
+      // 1. Fetch current ticket document from MongoDB
+      const ticket = await wekanServiceCollection.findOne({ ticketId: ticketId.trim() });
+      if (!ticket) {
+        throw new Error(`Ticket '${ticketId}' not found in database.`);
+      }
+
+      const { boardId, cardId } = ticket.wekan;
+      const assignedProviderMobile = ticket.assignedTo;
+      const finalCustomerMobile = customerMobile || ticket.customerMobile || ticket.customerPhone || "N/A";
+
+      // 2. Resolve "Canceled" List ID from Provider document
+      const provider = await providerCollection.findOne({ mobile: assignedProviderMobile });
+      let canceledListId = provider?.wekanLists?.["Canceled"] || provider?.wekanLists?.["Cancelled"];
+
+      // Fallback: Resolve list directly from Wekan if missing on provider doc
+      const baseUrl = process.env.WEKAN_BASE_URL || "http://wekan-app:8080";
+      const headers = await getWekanAuthHeaders();
+
+      if (!canceledListId) {
+        const listsRes = await fetch(`${baseUrl}/api/boards/${boardId}/lists`, {
+          method: "GET",
+          headers,
+        });
+
+        if (listsRes.ok) {
+          const lists = await listsRes.json();
+          const targetList = lists.find((l) =>
+            ["canceled", "cancelled"].includes(l.title?.trim().toLowerCase())
+          );
+          canceledListId = targetList?._id || targetList?.id;
+        }
+      }
+
+      if (!canceledListId) {
+        throw new Error(`"Canceled" list could not be resolved on Wekan Board ${boardId}`);
+      }
+
+      // 3. Construct updated description with customer number and reason
+      const cancelDescription = [
+        `❌ [STATUS]: CANCELED`,
+        `📞 Customer Mobile: ${finalCustomerMobile}`,
+        `📝 Reason: ${cancelReason}`,
+        `⏰ Cancelled At: ${new Date().toISOString()}`
+      ].join("\n");
+
+      // 4. Move card to Canceled list and update description in Wekan
+      const moveRes = await fetch(
+        `${baseUrl}/api/boards/${boardId}/lists/${canceledListId}/cards/${cardId}`,
+        {
+          method: "PUT",
+          headers,
+          body: JSON.stringify({
+            listId: canceledListId,
+            description: cancelDescription,
+          }),
+        }
+      );
+
+      if (!moveRes.ok) {
+        const errText = await moveRes.text();
+        throw new Error(`Wekan card update failed (${moveRes.status}): ${errText}`);
+      }
+
+      // 5. Update ticket status in MongoDB
+      const updateResult = await wekanServiceCollection.findOneAndUpdate(
+        { ticketId: ticketId.trim() },
+        {
+          $set: {
+            status: "CANCELED",
+            cancelReason,
+            "wekan.listId": canceledListId,
+            updatedAt: new Date()
+          }
+        },
+        { returnDocument: "after" }
+      );
+
+      return updateResult;
+    });
+
+    return c.json({
+      success: true,
+      message: `Ticket ${ticketId} canceled successfully.`,
+      data: updatedTicket
+    }, 200);
+
+  } catch (error) {
+    console.error("❌ Cancel Ticket Controller Error:", error);
+    return c.json({
+      success: false,
+      message: "Failed to cancel ticket",
       error: error.message
     }, 500);
   }
@@ -879,4 +1002,113 @@ export const getHomeServiceHistory = async (c) => {
   }
 };
 
+export const submitTicketRating = async (c) => {
+  try {
+    let body = {};
+    try {
+      body = await c.req.json();
+    } catch (_) {
+      body = await c.req.parseBody();
+    }
+
+    const { ticketId, reviewedBy, rating, feedback } = body;
+
+    // 1. Validation
+    if (!ticketId || !reviewedBy || rating === undefined) {
+      return c.json({
+        success: false,
+        message: "Missing required fields: ticketId, reviewedBy (CUSTOMER/PROVIDER), and rating (1-5)."
+      }, 400);
+    }
+
+    const numRating = Number(rating);
+    if (isNaN(numRating) || numRating < 1 || numRating > 5) {
+      return c.json({ success: false, message: "Rating must be a number between 1 and 5." }, 400);
+    }
+
+    const role = String(reviewedBy).trim().toUpperCase();
+    if (!["CUSTOMER", "PROVIDER"].includes(role)) {
+      return c.json({ success: false, message: "reviewedBy must be either 'CUSTOMER' or 'PROVIDER'." }, 400);
+    }
+
+    const ratingKey = role === "CUSTOMER" ? "ratings.byCustomer" : "ratings.byProvider";
+    const now = new Date();
+
+    const result = await withDatabase(mongoUri, async (db) => {
+      const wekanServiceCollection = db.collection("wekan-services");
+      const providerCollection = db.collection("service-providers");
+
+      // 2. Fetch ticket to verify status
+      const ticket = await wekanServiceCollection.findOne({ ticketId: ticketId.trim() });
+      if (!ticket) {
+        throw new Error(`Ticket '${ticketId}' not found.`);
+      }
+
+      if (ticket.status !== "COMPLETED") {
+        throw new Error(`Ratings can only be submitted for COMPLETED tickets. Current status: ${ticket.status}`);
+      }
+
+      // Check for existing review
+      if (ticket.ratings && ticket.ratings[role === "CUSTOMER" ? "byCustomer" : "byProvider"]) {
+        throw new Error(`Rating already submitted by ${role.toLowerCase()} for this ticket.`);
+      }
+
+      // 3. Update the ticket with rating
+      const updatedTicket = await wekanServiceCollection.findOneAndUpdate(
+        { ticketId: ticketId.trim() },
+        {
+          $set: {
+            [ratingKey]: {
+              rating: numRating,
+              feedback: (feedback || "").trim(),
+              submittedAt: now
+            },
+            updatedAt: now
+          }
+        },
+        { returnDocument: "after" }
+      );
+
+      // 4. If Customer rated the Provider, update Provider's aggregate average
+      if (role === "CUSTOMER" && ticket.assignedTo) {
+        const providerTickets = await wekanServiceCollection
+          .find({
+            assignedTo: ticket.assignedTo,
+            "ratings.byCustomer.rating": { $exists: true }
+          })
+          .toArray();
+
+        const totalReviews = providerTickets.length;
+        const sumRatings = providerTickets.reduce((acc, curr) => acc + curr.ratings.byCustomer.rating, 0);
+        const avgRating = Number((sumRatings / totalReviews).toFixed(1));
+
+        await providerCollection.updateOne(
+          { mobile: ticket.assignedTo },
+          {
+            $set: {
+              "ratingSummary.averageRating": avgRating,
+              "ratingSummary.totalReviews": totalReviews,
+              updatedAt: now
+            }
+          }
+        );
+      }
+
+      return updatedTicket;
+    });
+
+    return c.json({
+      success: true,
+      message: `Rating from ${role.toLowerCase()} submitted successfully.`,
+      data: result
+    }, 200);
+
+  } catch (error) {
+    console.error("❌ Rating Submission Error:", error);
+    return c.json({
+      success: false,
+      message: error.message || "Failed to submit rating",
+    }, 400);
+  }
+};
 

@@ -62,6 +62,7 @@ export const createProviderBoard = async (mobileNumber) => {
     "New",
     "Accepted",
     "Rejected",
+    "Canceled",
     "In Progress",
     "Waiting for Parts",
     "Completed",
