@@ -12,22 +12,33 @@ const mongoUri = process.env.MONGODB_URI;
 
 export const createHome = async (c) => {
   try {
-    const body = await c.req.json().catch(async () => await c.req.parseBody());
-    const { name, mobile, address, pincode, homeName } = body;
+    // 🛡️ Capture active transit headers
+    const incomingSecurityToken = c.req.header("x-auth-token");
+    const headerDeviceId = c.req.header("x-device-id");
 
-    if (!mobile) {
-      return c.json({
-        success: false,
-        message: "Missing required field: mobile is required."
-      }, 400);
+    const body = await c.req.json().catch(async () => await c.req.parseBody());
+    const { name, mobile, address, pincode, homeName, UserInfo, PlatformInfo, AppInfo } = body;
+
+    const rawMobile = mobile || UserInfo?.phoneNo || UserInfo?.mobile;
+    const incomingDevice = PlatformInfo?.devices?.[0] || PlatformInfo?.device;
+    const deviceId = headerDeviceId || incomingDevice?.deviceId;
+
+    // --- CRITICAL INPUT VALIDATIONS ---
+    if (!incomingSecurityToken) {
+      return c.json({ success: false, message: "Unauthorized: No security token provided in headers" }, 401);
+    }
+    if (!rawMobile) {
+      return c.json({ success: false, message: "Missing required field: mobile is required." }, 400);
+    }
+    if (!deviceId) {
+      return c.json({ success: false, message: "Device ID is required for session tracking." }, 400);
     }
 
-    const cleanMobile = mobile.toString().trim();
-    const cleanUserName = (name || "Guest").toString().trim();
+    const cleanMobile = rawMobile.toString().trim();
+    const cleanUserName = (name || UserInfo?.name || "Guest").toString().trim();
     const cleanHomeName = (homeName || "Default Home").toString().trim();
     const cleanAddress = (address || "").toString().trim();
     const cleanPincode = (pincode || "").toString().trim();
-
     const numMobile = Number(cleanMobile);
 
     const result = await withDatabase(mongoUri, async (db) => {
@@ -40,26 +51,76 @@ export const createHome = async (c) => {
       let userDoc = await usersCol.findOne({
         $or: [
           { mobile: cleanMobile },
-          { mobile: isNaN(numMobile) ? cleanMobile : numMobile }
+          { mobile: isNaN(numMobile) ? cleanMobile : numMobile },
+          { _id: cleanMobile }
         ]
       });
 
+      // 2. Multi-Device Session Management (PlatformInfo.devices)
+      let currentDevicesList = userDoc?.PlatformInfo?.devices || [];
+      const deviceExistsInDb = currentDevicesList.some(d => d.deviceId === deviceId);
+
+      // Update matching device or deactivate old ones
+      currentDevicesList = currentDevicesList.map(d => {
+        if (d.deviceId === deviceId) {
+          return {
+            ...d,
+            os: incomingDevice?.os || d.os || "Unknown",
+            version: incomingDevice?.version || d.version || "Unknown",
+            authToken: incomingSecurityToken,
+            fcmToken: incomingDevice?.fcmToken || d.fcmToken || UserInfo?.fcmToken,
+            lastUsedAt: now,
+            isLastLoggedIn: true
+          };
+        }
+        return {
+          ...d,
+          isLastLoggedIn: false
+        };
+      });
+
+      // Register new device session if not already in the array
+      if (!deviceExistsInDb) {
+        currentDevicesList.push({
+          deviceId: deviceId,
+          os: incomingDevice?.os || "Unknown",
+          version: incomingDevice?.version || "Unknown",
+          authToken: incomingSecurityToken,
+          fcmToken: incomingDevice?.fcmToken || UserInfo?.fcmToken,
+          lastUsedAt: now,
+          isLastLoggedIn: true
+        });
+      }
+
+      // Build User update/set payload
+      const setFields = {
+        name: cleanUserName,
+        mobile: cleanMobile,
+        updatedAt: now,
+        "PlatformInfo.devices": currentDevicesList,
+        "UserInfo.name": cleanUserName,
+        "UserInfo.phoneNo": cleanMobile,
+        "UserInfo.role": userDoc?.UserInfo?.role || UserInfo?.role || "user"
+      };
+
+      if (AppInfo) {
+        setFields.AppInfo = AppInfo;
+      }
+
       if (!userDoc) {
         const insertRes = await usersCol.insertOne({
-          mobile: cleanMobile,
-          name: cleanUserName,
-          createdAt: now,
-          updatedAt: now
+          ...setFields,
+          createdAt: now
         });
-        userDoc = { _id: insertRes.insertedId, mobile: cleanMobile, name: cleanUserName };
-      } else if (cleanUserName !== "Guest" && userDoc.name !== cleanUserName) {
+        userDoc = { _id: insertRes.insertedId, ...setFields };
+      } else {
         await usersCol.updateOne(
           { _id: userDoc._id },
-          { $set: { name: cleanUserName, updatedAt: now } }
+          { $set: setFields }
         );
       }
 
-      // 2. Check duplicate ONLY if exact same address and homeName already exist for this user
+      // 3. Check duplicate ONLY if exact same address and homeName already exist for this user
       let existingHome = null;
       if (cleanAddress) {
         existingHome = await homesCol.findOne({
@@ -70,10 +131,10 @@ export const createHome = async (c) => {
       }
 
       if (existingHome) {
-        return { homeId: existingHome._id.toString(), reused: true };
+        return { homeId: existingHome._id.toString(), reused: true, userId: userDoc._id };
       }
 
-      // 3. Create distinct new Home (Allows user to have multiple homes)
+      // 4. Create distinct new Home (Allows user to have multiple homes)
       const homeInsert = await homesCol.insertOne({
         ownerId: userDoc._id,
         homeName: cleanHomeName,
@@ -84,13 +145,16 @@ export const createHome = async (c) => {
         updatedAt: now
       });
 
-      return { homeId: homeInsert.insertedId.toString(), reused: false };
+      return { homeId: homeInsert.insertedId.toString(), reused: false, userId: userDoc._id };
     });
 
     return c.json({
       success: true,
       message: result.reused ? "Existing home reused." : "Home created successfully.",
-      data: { homeId: result.homeId }
+      data: {
+        homeId: result.homeId,
+        userId: result.userId
+      }
     }, result.reused ? 200 : 201);
 
   } catch (error) {

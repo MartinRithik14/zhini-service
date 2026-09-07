@@ -41,7 +41,7 @@ const getConnectedClient = async (uri) => {
 export const withDatabase = async (uri, callback) => {
   try {
     const activeClient = await getConnectedClient(uri);
-    const db = activeClient.db("zhini-prod");
+    const db = activeClient.db("zhini-dev");
     
     return await callback(db);
     
