@@ -773,6 +773,129 @@ export const deleteRoomProduct = async (c) => {
   return c.json({ success: true, message: 'Product deleted successfully' });
 };
 
+export const deleteRoom = async (c) => {
+  try {
+    // 1. Extract params/body
+    const paramRoomId = c.req.param("roomId");
+    const body = await c.req.json().catch(async () => await c.req.parseBody().catch(() => ({})));
+    const targetRoomId = paramRoomId || body?.roomId;
+    const targetHomeId = body?.homeId;
+
+    // 2. Input Validations
+    if (!targetRoomId) {
+      return c.json({
+        success: false,
+        message: "Missing required field: roomId is required to delete a room."
+      }, 400);
+    }
+
+    if (!ObjectId.isValid(targetRoomId)) {
+      return c.json({
+        success: false,
+        message: "Invalid roomId format provided."
+      }, 400);
+    }
+
+    if (targetHomeId && !ObjectId.isValid(targetHomeId)) {
+      return c.json({
+        success: false,
+        message: "Invalid homeId format provided."
+      }, 400);
+    }
+
+    const roomObjectId = new ObjectId(targetRoomId);
+
+    // 3. Database Execution
+    const result = await withDatabase(mongoUri, async (db) => {
+      const roomsCol = db.collection("rooms");
+      const homesCol = db.collection("homes");
+      const devicesCol = db.collection("devices");
+
+      // Verify room exists (optionally scoped to homeId if provided)
+      const roomQuery = { _id: roomObjectId };
+      if (targetHomeId) {
+        const homeObjectId = new ObjectId(targetHomeId);
+        roomQuery.$or = [
+          { homeId: homeObjectId },
+          { homeId: targetHomeId.toString() }
+        ];
+      }
+
+      const roomDoc = await roomsCol.findOne(roomQuery);
+      if (!roomDoc) {
+        throw new Error("ROOM_NOT_FOUND");
+      }
+
+      const linkedHomeId = roomDoc.homeId;
+
+      // Unlink room reference from parent home document if stored in an array
+      if (linkedHomeId) {
+        const homeQuery = ObjectId.isValid(linkedHomeId)
+          ? { _id: new ObjectId(linkedHomeId) }
+          : { _id: linkedHomeId };
+
+        await homesCol.updateOne(homeQuery, {
+          $pull: {
+            rooms: {
+              $in: [roomObjectId, targetRoomId.toString()]
+            }
+          },
+          $set: { updatedAt: new Date().toISOString() }
+        });
+      }
+
+      // Cleanup associated devices inside this room (unassign room or cascade)
+      const deviceCleanupRes = await devicesCol.updateMany(
+        {
+          $or: [
+            { roomId: roomObjectId },
+            { roomId: targetRoomId.toString() }
+          ]
+        },
+        {
+          $unset: { roomId: "" },
+          $set: { updatedAt: new Date().toISOString() }
+        }
+      );
+
+      // Delete the room document
+      const deleteRes = await roomsCol.deleteOne({ _id: roomObjectId });
+
+      return {
+        deleted: deleteRes.deletedCount > 0,
+        roomId: targetRoomId,
+        homeId: linkedHomeId ? linkedHomeId.toString() : null,
+        unlinkedDevicesCount: deviceCleanupRes.modifiedCount
+      };
+    });
+
+    return c.json({
+      success: true,
+      message: "Room deleted successfully.",
+      data: result
+    }, 200);
+
+  } catch (error) {
+    console.error("❌ Delete Room Controller Error:", error);
+
+    if (error.message === "ROOM_NOT_FOUND") {
+      return c.json({
+        success: false,
+        message: "No room record found with the provided roomId."
+      }, 404);
+    }
+
+    return c.json({
+      success: false,
+      message: "Internal Server Error",
+      error: error.message
+    }, 500);
+  }
+};
+
+
+
+
 
 const GEMINI_KEYS = [
   process.env.KEY_1,
@@ -1089,3 +1212,5 @@ export const getSubmissionByMobile = async (c) => {
     }, 500);
   }
 };
+
+

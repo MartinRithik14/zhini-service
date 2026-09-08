@@ -1,33 +1,17 @@
-version: '3'
-
 services:
-  wekan-db:
-    image: mongo:4.4.7
-    container_name: wekan-db
-    restart: always
-    command: mongod --oplogSize 128
-    volumes:
-      - wekan-db-data:/data/db
-    networks:
-      - app-network
-
-  wekan:
-    image: quay.io/wekan/wekan:latest
-    container_name: wekan-app
+  board:
+    image: ghcr.io/zhini-co-in/board:1.0.26090801
+    container_name: board-app
     restart: always
     ports:
       - "4000:8080"
-    environment:
-      - MONGO_URL=mongodb://wekan-db:27017/wekan
-      - ROOT_URL=http://localhost:4000
-      - WITH_API=true
-    depends_on:
-      - wekan-db
     networks:
       - app-network
-
-volumes:
-  wekan-db-data:
+    environment:
+      - MONGO_URL=mongodb://dev_db_user:7cBNvaJmiJdasAgJ@ac-epobvi7-shard-00-00.dhu5rvl.mongodb.net:27017,ac-epobvi7-shard-00-01.dhu5rvl.mongodb.net:27017,ac-epobvi7-shard-00-02.dhu5rvl.mongodb.net:27017/board?ssl=true&replicaSet=atlas-je3c22-shard-0&authSource=admin&appName=kondaas
+      - ROOT_URL=http://localhost:4000
+      - PORT=8080
+      - WITH_API=true
 
 networks:
   app-network:

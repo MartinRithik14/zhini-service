@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { createHome,createProductSubmission,getSubmissionByMobile,AIassist,addMember,updateEntity,deleteMember,deleteRoomProduct } from '../controllers/productController.js';
+import { createHome,createProductSubmission,deleteRoom,getSubmissionByMobile,AIassist,addMember,updateEntity,deleteMember,deleteRoomProduct } from '../controllers/productController.js';
 
 const productRouter = new Hono();
 
@@ -10,7 +10,7 @@ productRouter.put('/update', updateEntity);
 
 productRouter.post('/member', addMember);
 productRouter.delete('/delete-member/:homeId', deleteMember);
-
+productRouter.delete('/delete-room/:homeId', deleteRoom);
 
 productRouter.delete('/delete-product/:homeId', deleteRoomProduct);
 
