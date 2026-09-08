@@ -2,7 +2,6 @@ import { withDatabase } from '../utils/config.js';
 import { ObjectId } from "mongodb";
 import { GoogleGenAI, Type } from "@google/genai";
 import { uploadToR2 } from "../services/r2.service.js";
-import path from 'path';
 import crypto from 'crypto';
 
 
@@ -172,7 +171,7 @@ export const createProductSubmission = async (c) => {
 
     const { homeId, name, mobile, roomName, product, brand, warranty } = body;
     const file = body.file; // File object or undefined
-
+ 
     // Validation: homeId, mobile, product, and brand are mandatory
     if (!homeId || !mobile || !product || !brand) {
       return c.json({
@@ -187,15 +186,14 @@ export const createProductSubmission = async (c) => {
 
     // 2. Handle Cloudflare R2 Image Upload
     let imageUrl = null;
-    if (file && typeof file !== 'string' && file.name) {
+    if (file && typeof file !== "string" && file.name) {
       imageUrl = await uploadToR2(file, "product-images");
     }
 
-    const cleanMobile = mobile.trim();
-    const cleanName = (name || "Member").trim();
+    const cleanMobile = mobile.toString().trim();
+    const cleanName = (name || "Member").toString().trim();
     const targetHomeId = new ObjectId(homeId);
-    // If no room specified, default to "default"
-    const targetRoomName = (roomName || "default").trim().toLowerCase();
+    const targetRoomName = (roomName || "Default Room").toString().trim();
 
     // 3. Database Operations
     const result = await withDatabase(mongoUri, async (db) => {
@@ -212,7 +210,7 @@ export const createProductSubmission = async (c) => {
         throw new Error("HOME_NOT_FOUND");
       }
 
-      // STEP B: Upsert User & Link to Home
+      // STEP B: Upsert User & Link to Unified User Schema
       const numMobile = Number(cleanMobile);
       const user = await usersCol.findOneAndUpdate(
         {
@@ -225,8 +223,15 @@ export const createProductSubmission = async (c) => {
           $setOnInsert: {
             name: cleanName,
             mobile: cleanMobile,
-            roles: ["member"],
-            createdAt: now
+            createdAt: now,
+            UserInfo: {
+              name: cleanName,
+              phoneNo: cleanMobile,
+              role: "member"
+            },
+            PlatformInfo: {
+              devices: []
+            }
           },
           $set: { updatedAt: now }
         },
@@ -246,12 +251,13 @@ export const createProductSubmission = async (c) => {
       );
 
       // STEP C: Find or Create Room on demand
+      const escapedRoomName = targetRoomName.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&");
       let room = await roomsCol.findOne({
         $or: [
           { homeId: targetHomeId },
           { homeId: targetHomeId.toString() }
         ],
-        roomName: { $regex: new RegExp(`^${targetRoomName.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&')}$`, 'i') }
+        roomName: { $regex: new RegExp(`^${escapedRoomName}$`, "i") }
       });
 
       if (!room) {
@@ -265,14 +271,14 @@ export const createProductSubmission = async (c) => {
       }
 
       // STEP D: Create Device Entry
-      const deviceId = `DEV-${Date.now()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+      const deviceId = `DEV-${Date.now()}-${crypto.randomBytes(2).toString("hex").toUpperCase()}`;
 
       const newDevice = {
         deviceId: deviceId,
         homeId: targetHomeId,
         roomId: room._id,
-        product: product.trim(),
-        brand: brand.trim(),
+        product: product.toString().trim(),
+        brand: brand.toString().trim(),
         warranty: warranty || null,
         imageUrl: imageUrl,
         addedByUserId: user._id,
@@ -292,7 +298,11 @@ export const createProductSubmission = async (c) => {
       };
     });
 
-    return c.json({ success: true, message: "Device registered successfully.", data: result }, 200);
+    return c.json({
+      success: true,
+      message: "Device registered successfully.",
+      data: result
+    }, 200);
 
   } catch (error) {
     console.error("❌ Product Submission Controller Error:", error);
@@ -306,25 +316,27 @@ export const createProductSubmission = async (c) => {
 };
 
 
+
 export const updateEntity = async (c) => {
   try {
     const body = await c.req.json().catch(async () => await c.req.parseBody());
 
     const {
       homeId,
-      name,
-      mobile,
+      homeName,
       address,
       pincode,
-      roomName,
+      name,
+      mobile,
       roomId,
+      roomName,
       deviceId,
       product,
       brand,
       warranty
     } = body;
 
-    // Validation: homeId is now the primary root anchor
+    // Validation: homeId is the primary root anchor
     if (!homeId) {
       return c.json({
         success: false,
@@ -347,7 +359,7 @@ export const updateEntity = async (c) => {
       const roomsCol = db.collection("rooms");
       const devicesCol = db.collection("devices");
 
-      // 1. Verify Home exists and fetch linked user
+      // 1. Verify Home exists and identify linked owner
       const homeDoc = await homesCol.findOne({ _id: targetHomeId });
       if (!homeDoc) {
         throw new Error("HOME_NOT_FOUND");
@@ -357,16 +369,19 @@ export const updateEntity = async (c) => {
         homeUpdated: false,
         userUpdated: false,
         roomUpdated: false,
+        roomCreated: false,
+        createdRoomId: null,
         deviceUpdated: false
       };
 
       const now = new Date().toISOString();
 
-      // 2. Update Home Collection (Address / Pincode)
-      if (address || pincode) {
+      // 2. Optional: Edit Home Details (homeName, address, pincode)
+      if (homeName !== undefined || address !== undefined || pincode !== undefined) {
         const homeUpdates = { updatedAt: now };
-        if (address) homeUpdates.address = address.trim();
-        if (pincode) homeUpdates.pincode = pincode.trim();
+        if (homeName !== undefined) homeUpdates.homeName = homeName.trim();
+        if (address !== undefined) homeUpdates.address = address.trim();
+        if (pincode !== undefined) homeUpdates.pincode = pincode.trim();
 
         const homeRes = await homesCol.updateOne(
           { _id: targetHomeId },
@@ -375,49 +390,78 @@ export const updateEntity = async (c) => {
         updatedSummary.homeUpdated = homeRes.modifiedCount > 0;
       }
 
-      // 3. Update User Collection (Name / Mobile)
+      // 3. Optional: Edit User Details (name, mobile, UserInfo)
       const linkedUserId = homeDoc.ownerId || homeDoc.userId || (homeDoc.members && homeDoc.members[0]);
-      if (linkedUserId && (name || mobile)) {
+      if (linkedUserId && (name !== undefined || mobile !== undefined)) {
         const userUpdates = { updatedAt: now };
-        if (name) userUpdates.name = name.trim();
-        if (mobile) userUpdates.mobile = mobile.trim();
+
+        if (name !== undefined) {
+          const cleanName = name.trim();
+          userUpdates.name = cleanName;
+          userUpdates["UserInfo.name"] = cleanName;
+        }
+
+        if (mobile !== undefined) {
+          const cleanMobile = mobile.toString().trim();
+          userUpdates.mobile = cleanMobile;
+          userUpdates["UserInfo.phoneNo"] = cleanMobile;
+        }
+
+        const userQuery = ObjectId.isValid(linkedUserId)
+          ? { _id: new ObjectId(linkedUserId) }
+          : { _id: linkedUserId };
 
         const userRes = await usersCol.updateOne(
-          { _id: new ObjectId(linkedUserId) },
+          userQuery,
           { $set: userUpdates }
         );
         updatedSummary.userUpdated = userRes.modifiedCount > 0;
       }
 
-      // 4. Update Room Collection (Rename room for this home)
+      // 4. Room Management: Update existing OR Add new Room
       if (roomName) {
-        const cleanRoomName = roomName.trim().toLowerCase();
-        
-        let roomQuery = {};
+        const cleanRoomName = roomName.trim();
+
+        let existingRoom = null;
+
         if (roomId && ObjectId.isValid(roomId)) {
-          roomQuery = { _id: new ObjectId(roomId), homeId: targetHomeId };
+          existingRoom = await roomsCol.findOne({
+            _id: new ObjectId(roomId),
+            $or: [{ homeId: targetHomeId }, { homeId: targetHomeId.toString() }]
+          });
         } else {
-          // If no specific roomId is passed, update the room attached to this homeId
-          roomQuery = {
-            $or: [
-              { homeId: targetHomeId },
-              { homeId: targetHomeId.toString() }
-            ]
-          };
+          // If roomId is not supplied, check if a room with this name already exists in this home
+          existingRoom = await roomsCol.findOne({
+            $or: [{ homeId: targetHomeId }, { homeId: targetHomeId.toString() }],
+            roomName: { $regex: new RegExp(`^${cleanRoomName}$`, "i") }
+          });
         }
 
-        const roomRes = await roomsCol.updateOne(
-          roomQuery,
-          { $set: { roomName: cleanRoomName, updatedAt: now } }
-        );
-        updatedSummary.roomUpdated = roomRes.modifiedCount > 0;
+        if (existingRoom) {
+          // Update existing room
+          const roomRes = await roomsCol.updateOne(
+            { _id: existingRoom._id },
+            { $set: { roomName: cleanRoomName, updatedAt: now } }
+          );
+          updatedSummary.roomUpdated = roomRes.modifiedCount > 0;
+        } else {
+          // Add brand-new room linked to this home
+          const insertRoomRes = await roomsCol.insertOne({
+            homeId: targetHomeId,
+            roomName: cleanRoomName,
+            createdAt: now,
+            updatedAt: now
+          });
+          updatedSummary.roomCreated = true;
+          updatedSummary.createdRoomId = insertRoomRes.insertedId.toString();
+        }
       }
 
-      // 5. Update Device Collection (If device details or deviceId are provided)
-      if (deviceId && (product || brand || warranty !== undefined)) {
+      // 5. Optional: Edit Device Details
+      if (deviceId && (product !== undefined || brand !== undefined || warranty !== undefined)) {
         const deviceUpdates = { updatedAt: now };
-        if (product) deviceUpdates.product = product.trim();
-        if (brand) deviceUpdates.brand = brand.trim();
+        if (product !== undefined) deviceUpdates.product = product.trim();
+        if (brand !== undefined) deviceUpdates.brand = brand.trim();
         if (warranty !== undefined) deviceUpdates.warranty = warranty;
 
         const deviceRes = await devicesCol.updateOne(
@@ -426,7 +470,10 @@ export const updateEntity = async (c) => {
               { deviceId: deviceId },
               ObjectId.isValid(deviceId) ? { _id: new ObjectId(deviceId) } : { deviceId: deviceId }
             ],
-            homeId: targetHomeId
+            $or: [
+              { homeId: targetHomeId },
+              { homeId: targetHomeId.toString() }
+            ]
           },
           { $set: deviceUpdates }
         );
@@ -526,26 +573,34 @@ export const addMember = async (c) => {
         return { status: "HOME_NOT_FOUND" };
       }
 
-      // C. Upsert the new member user in users collection
-      let newMemberUser = await usersCol.findOne({
-        $or: [
-          { mobile: cleanNewMobile },
-          { mobile: isNaN(numNewMobile) ? cleanNewMobile : numNewMobile }
-        ]
-      });
+      // C. Upsert the new member user in users collection matching schema standard
+      const newMemberUser = await usersCol.findOneAndUpdate(
+        {
+          $or: [
+            { mobile: cleanNewMobile },
+            { mobile: isNaN(numNewMobile) ? cleanNewMobile : numNewMobile }
+          ]
+        },
+        {
+          $setOnInsert: {
+            name: cleanNewName,
+            mobile: cleanNewMobile,
+            createdAt: now,
+            UserInfo: {
+              name: cleanNewName,
+              phoneNo: cleanNewMobile,
+              role: "member"
+            },
+            PlatformInfo: {
+              devices: []
+            }
+          },
+          $set: { updatedAt: now }
+        },
+        { upsert: true, returnDocument: "after" }
+      );
 
-      if (!newMemberUser) {
-        const newUserResult = await usersCol.insertOne({
-          name: cleanNewName,
-          mobile: cleanNewMobile,
-          roles: ["member"],
-          createdAt: now,
-          updatedAt: now
-        });
-        newMemberUser = { _id: newUserResult.insertedId };
-      }
-
-      // D. Check if already a member
+      // D. Check if already a member in this home
       const memberArray = targetHome.members || targetHome.memberIds || [];
       const isAlreadyMember = memberArray.some(
         (id) => id.toString() === newMemberUser._id.toString()
