@@ -5,3 +5,5 @@ dist/
 .DS_Store
 zhini.tar
 firebase-keyz.json
+docker-compose*.yml
+docker-compose*.yaml
