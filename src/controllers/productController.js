@@ -171,7 +171,7 @@ export const createProductSubmission = async (c) => {
 
     const { homeId, name, mobile, roomName, product, brand, warranty } = body;
     const file = body.file; // File object or undefined
- 
+
     // Validation: homeId, mobile, product, and brand are mandatory
     if (!homeId || !mobile || !product || !brand) {
       return c.json({
@@ -184,15 +184,20 @@ export const createProductSubmission = async (c) => {
       return c.json({ success: false, message: "Invalid homeId format provided." }, 400);
     }
 
-    // 2. Handle Cloudflare R2 Image Upload
+    const cleanHomeId = homeId.toString().trim();
+
+    // 2. Handle Cloudflare R2 Image Upload with homeId structuring
     let imageUrl = null;
     if (file && typeof file !== "string" && file.name) {
-      imageUrl = await uploadToR2(file, "product-images");
+      imageUrl = await uploadToR2(file, {
+        homeId: cleanHomeId,
+        folder: "product-images"
+      });
     }
 
     const cleanMobile = mobile.toString().trim();
     const cleanName = (name || "Member").toString().trim();
-    const targetHomeId = new ObjectId(homeId);
+    const targetHomeId = new ObjectId(cleanHomeId);
     const targetRoomName = (roomName || "Default Room").toString().trim();
 
     // 3. Database Operations
@@ -294,7 +299,8 @@ export const createProductSubmission = async (c) => {
         homeId: targetHomeId,
         roomId: room._id,
         roomName: room.roomName,
-        userId: user._id
+        userId: user._id,
+        imageUrl: imageUrl
       };
     });
 
