@@ -1,73 +1,82 @@
 import { withDatabase } from '../utils/config.js';
 import { ObjectId } from "mongodb";
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 import { uploadToR2 } from "../services/r2.service.js";
+import { verifyFirebaseToken } from '../utils/firebase.js';
 import crypto from 'crypto';
 
 
 
 const mongoUri = process.env.MONGODB_URI;
 
-
-export const createHome = async (c) => {
+export const syncUserSession = async (c) => {
   try {
-    // 🛡️ Capture active transit headers
-    const incomingSecurityToken = c.req.header("x-auth-token");
+    const incomingSecurityToken =
+      c.req.header("x-auth-token") ||
+      c.req.header("Authorization")?.replace(/^Bearer\s+/i, "");
     const headerDeviceId = c.req.header("x-device-id");
 
-    const body = await c.req.json().catch(async () => await c.req.parseBody());
-    const { name, mobile, address, pincode, homeName, UserInfo, PlatformInfo, AppInfo } = body;
+    const body = await c.req.json().catch(() => ({}));
+    const rawMobile = body.mobile || body.UserInfo?.phoneNo || body.phoneNo;
+    const incomingDevice = body.PlatformInfo?.devices?.[0] || body.PlatformInfo?.device || body.device;
+    const deviceId = headerDeviceId || incomingDevice?.deviceId || body.deviceId;
 
-    const rawMobile = mobile || UserInfo?.phoneNo || UserInfo?.mobile;
-    const incomingDevice = PlatformInfo?.devices?.[0] || PlatformInfo?.device;
-    const deviceId = headerDeviceId || incomingDevice?.deviceId;
-
-    // --- CRITICAL INPUT VALIDATIONS ---
     if (!incomingSecurityToken) {
-      return c.json({ success: false, message: "Unauthorized: No security token provided in headers" }, 401);
+      return c.json({ success: false, error: "Unauthorized: Missing security token" }, 401);
     }
     if (!rawMobile) {
       return c.json({ success: false, message: "Missing required field: mobile is required." }, 400);
     }
     if (!deviceId) {
-      return c.json({ success: false, message: "Device ID is required for session tracking." }, 400);
+      return c.json({ success: false, message: "Device ID is required." }, 400);
+    }
+
+    // Verify the refreshed Firebase token
+    try {
+      await verifyFirebaseToken(incomingSecurityToken);
+    } catch (authError) {
+      return c.json({
+        success: false,
+        error: "Unauthorized: Invalid or expired Firebase security token.",
+        details: authError.message
+      }, 401);
     }
 
     const cleanMobile = rawMobile.toString().trim();
-    const cleanUserName = (name || UserInfo?.name || "Guest").toString().trim();
-    const cleanHomeName = (homeName || "Default Home").toString().trim();
-    const cleanAddress = (address || "").toString().trim();
-    const cleanPincode = (pincode || "").toString().trim();
     const numMobile = Number(cleanMobile);
+    const now = new Date().toISOString();
 
-    const result = await withDatabase(mongoUri, async (db) => {
+    return await withDatabase(process.env.MONGODB_URI, async (db) => {
       const usersCol = db.collection("users");
-      const homesCol = db.collection("homes");
 
-      const now = new Date().toISOString();
-
-      // 1. Upsert / Find user by mobile
-      let userDoc = await usersCol.findOne({
+      const existingUser = await usersCol.findOne({
         $or: [
           { mobile: cleanMobile },
           { mobile: isNaN(numMobile) ? cleanMobile : numMobile },
-          { _id: cleanMobile }
+          { "UserInfo.phoneNo": cleanMobile }
         ]
       });
 
-      // 2. Multi-Device Session Management (PlatformInfo.devices)
-      let currentDevicesList = userDoc?.PlatformInfo?.devices || [];
-      const deviceExistsInDb = currentDevicesList.some(d => d.deviceId === deviceId);
+      if (!existingUser) {
+        return c.json({ success: false, message: "User profile not found. Please create home/register first." }, 404);
+      }
 
-      // Update matching device or deactivate old ones
-      currentDevicesList = currentDevicesList.map(d => {
+      let currentDevicesList =
+        existingUser["PlatformInfo.devices"] ||
+        existingUser.PlatformInfo?.devices ||
+        [];
+
+      let deviceFound = false;
+
+      currentDevicesList = currentDevicesList.map((d) => {
         if (d.deviceId === deviceId) {
+          deviceFound = true;
           return {
             ...d,
-            os: incomingDevice?.os || d.os || "Unknown",
-            version: incomingDevice?.version || d.version || "Unknown",
+            os: incomingDevice?.os || body.os || d.os || "Unknown",
+            version: incomingDevice?.version || body.version || d.version || "Unknown",
             authToken: incomingSecurityToken,
-            fcmToken: incomingDevice?.fcmToken || d.fcmToken || UserInfo?.fcmToken,
+            fcmToken: incomingDevice?.fcmToken || body.fcmToken || d.fcmToken || null,
             lastUsedAt: now,
             isLastLoggedIn: true
           };
@@ -78,20 +87,142 @@ export const createHome = async (c) => {
         };
       });
 
-      // Register new device session if not already in the array
-      if (!deviceExistsInDb) {
+      if (!deviceFound) {
         currentDevicesList.push({
           deviceId: deviceId,
-          os: incomingDevice?.os || "Unknown",
-          version: incomingDevice?.version || "Unknown",
+          os: incomingDevice?.os || body.os || "Unknown",
+          version: incomingDevice?.version || body.version || "Unknown",
           authToken: incomingSecurityToken,
-          fcmToken: incomingDevice?.fcmToken || UserInfo?.fcmToken,
+          fcmToken: incomingDevice?.fcmToken || body.fcmToken || null,
           lastUsedAt: now,
           isLastLoggedIn: true
         });
       }
 
-      // Build User update/set payload
+      await usersCol.updateOne(
+        { _id: existingUser._id },
+        {
+          $set: {
+            "PlatformInfo.devices": currentDevicesList,
+            updatedAt: now
+          }
+        }
+      );
+
+      return c.json({
+        success: true,
+        message: "Session token updated successfully."
+      }, 200);
+    });
+
+  } catch (err) {
+    console.error("❌ Sync User Session Error:", err);
+    return c.json({ success: false, error: "Internal Server Error", details: err.message }, 500);
+  }
+};
+
+
+
+export const createHome = async (c) => {
+  try {
+    // 1. Capture transit security headers
+    const incomingSecurityToken =
+      c.req.header("x-auth-token") ||
+      c.req.header("Authorization")?.replace(/^Bearer\s+/i, "");
+    const headerDeviceId = c.req.header("x-device-id");
+
+    const body = await c.req.json().catch(async () => await c.req.parseBody());
+    const { name, mobile, address, pincode, homeName, UserInfo, PlatformInfo, AppInfo } = body;
+
+    const rawMobile = mobile || UserInfo?.phoneNo || UserInfo?.mobile;
+    const incomingDevice = PlatformInfo?.devices?.[0] || PlatformInfo?.device;
+    const deviceId = headerDeviceId || incomingDevice?.deviceId;
+
+    // 2. Input Validations
+    if (!incomingSecurityToken) {
+      return c.json({ success: false, error: "Unauthorized: No security token provided in headers" }, 401);
+    }
+    if (!rawMobile) {
+      return c.json({ success: false, message: "Missing required field: mobile is required." }, 400);
+    }
+    if (!deviceId) {
+      return c.json({ success: false, message: "Device ID is required for session tracking." }, 400);
+    }
+
+    // 3. Verify Firebase Auth Token
+    let decodedToken;
+    try {
+      decodedToken = await verifyFirebaseToken(incomingSecurityToken);
+    } catch (authError) {
+      return c.json({
+        success: false,
+        error: "Unauthorized: Invalid or expired Firebase security token.",
+        details: authError.message
+      }, 401);
+    }
+
+    const cleanMobile = rawMobile.toString().trim();
+    const cleanUserName = (name || UserInfo?.name || decodedToken.name || "Guest").toString().trim();
+    const cleanHomeName = (homeName || "Default Home").toString().trim();
+    const cleanAddress = (address || "").toString().trim();
+    const cleanPincode = (pincode || "").toString().trim();
+    const numMobile = Number(cleanMobile);
+
+    const result = await withDatabase(process.env.MONGODB_URI, async (db) => {
+      const usersCol = db.collection("users");
+      const homesCol = db.collection("homes");
+
+      const now = new Date().toISOString();
+
+      // 4. Find existing user
+      let userDoc = await usersCol.findOne({
+        $or: [
+          { mobile: cleanMobile },
+          { mobile: isNaN(numMobile) ? cleanMobile : numMobile },
+          { "UserInfo.phoneNo": cleanMobile }
+        ]
+      });
+
+      // 5. Multi-Device Session Management (PlatformInfo.devices)
+      let currentDevicesList =
+        userDoc?.["PlatformInfo.devices"] ||
+        userDoc?.PlatformInfo?.devices ||
+        [];
+
+      let deviceFound = false;
+
+      currentDevicesList = currentDevicesList.map((d) => {
+        if (d.deviceId === deviceId) {
+          deviceFound = true;
+          return {
+            ...d,
+            os: incomingDevice?.os || d.os || "Unknown",
+            version: incomingDevice?.version || d.version || "Unknown",
+            authToken: incomingSecurityToken,
+            fcmToken: incomingDevice?.fcmToken || d.fcmToken || UserInfo?.fcmToken || null,
+            lastUsedAt: now,
+            isLastLoggedIn: true
+          };
+        }
+        return {
+          ...d,
+          isLastLoggedIn: false
+        };
+      });
+
+      if (!deviceFound) {
+        currentDevicesList.push({
+          deviceId: deviceId,
+          os: incomingDevice?.os || "Unknown",
+          version: incomingDevice?.version || "Unknown",
+          authToken: incomingSecurityToken,
+          fcmToken: incomingDevice?.fcmToken || UserInfo?.fcmToken || null,
+          lastUsedAt: now,
+          isLastLoggedIn: true
+        });
+      }
+
+      // 6. Build User Update / Upsert Payload
       const setFields = {
         name: cleanUserName,
         mobile: cleanMobile,
@@ -99,52 +230,58 @@ export const createHome = async (c) => {
         "PlatformInfo.devices": currentDevicesList,
         "UserInfo.name": cleanUserName,
         "UserInfo.phoneNo": cleanMobile,
-        "UserInfo.role": userDoc?.UserInfo?.role || UserInfo?.role || "user"
+        "UserInfo.role": userDoc?.["UserInfo.role"] || userDoc?.UserInfo?.role || UserInfo?.role || "user"
       };
 
       if (AppInfo) {
         setFields.AppInfo = AppInfo;
       }
 
-      if (!userDoc) {
-        const insertRes = await usersCol.insertOne({
-          ...setFields,
-          createdAt: now
-        });
-        userDoc = { _id: insertRes.insertedId, ...setFields };
-      } else {
-        await usersCol.updateOne(
-          { _id: userDoc._id },
-          { $set: setFields }
-        );
-      }
+      const user = await usersCol.findOneAndUpdate(
+        {
+          $or: [
+            { mobile: cleanMobile },
+            { mobile: isNaN(numMobile) ? cleanMobile : numMobile }
+          ]
+        },
+        {
+          $set: setFields,
+          $setOnInsert: {
+            createdAt: now
+          }
+        },
+        { upsert: true, returnDocument: "after" }
+      );
 
-      // 3. Check duplicate ONLY if exact same address and homeName already exist for this user
+      const userId = user._id;
+
+      // 7. Check for duplicate home
       let existingHome = null;
       if (cleanAddress) {
         existingHome = await homesCol.findOne({
-          ownerId: userDoc._id,
+          ownerId: userId,
           address: cleanAddress,
           homeName: cleanHomeName
         });
       }
 
       if (existingHome) {
-        return { homeId: existingHome._id.toString(), reused: true, userId: userDoc._id };
+        return { homeId: existingHome._id.toString(), reused: true, userId };
       }
 
-      // 4. Create distinct new Home (Allows user to have multiple homes)
+      // 8. Create Home
       const homeInsert = await homesCol.insertOne({
-        ownerId: userDoc._id,
+        ownerId: userId,
         homeName: cleanHomeName,
         address: cleanAddress,
         pincode: cleanPincode,
-        members: [userDoc._id],
+        members: [userId],
+        memberIds: [userId],
         createdAt: now,
         updatedAt: now
       });
 
-      return { homeId: homeInsert.insertedId.toString(), reused: false, userId: userDoc._id };
+      return { homeId: homeInsert.insertedId.toString(), reused: false, userId };
     });
 
     return c.json({
@@ -162,31 +299,38 @@ export const createHome = async (c) => {
   }
 };
 
-
-
 export const createProductSubmission = async (c) => {
   try {
-    // 1. Parse multipart/form-data request
+    // 1. Get authenticated user resolved from requireAuth middleware
+    const currentUser = c.get("user");
+    const userId = currentUser._id;
+    const cleanMobile = currentUser.mobile || currentUser?.UserInfo?.phoneNo;
+
+    // 2. Parse multipart/form-data request
     const body = await c.req.parseBody();
+    const { homeId, roomName, product, brand, warranty } = body;
+    const file = body.file; // Uploaded File object or undefined
 
-    const { homeId, name, mobile, roomName, product, brand, warranty } = body;
-    const file = body.file; // File object or undefined
-
-    // Validation: homeId, mobile, product, and brand are mandatory
-    if (!homeId || !mobile || !product || !brand) {
+    // 3. Validation
+    if (!homeId || !product || !brand) {
       return c.json({
         success: false,
-        message: "Missing required fields (homeId, mobile, product, brand)."
+        message: "Missing required fields: homeId, product, and brand are mandatory."
       }, 400);
     }
 
     if (!ObjectId.isValid(homeId)) {
-      return c.json({ success: false, message: "Invalid homeId format provided." }, 400);
+      return c.json({
+        success: false,
+        message: "Invalid homeId format provided."
+      }, 400);
     }
 
     const cleanHomeId = homeId.toString().trim();
+    const targetHomeId = new ObjectId(cleanHomeId);
+    const targetRoomName = (roomName || "Default Room").toString().trim();
 
-    // 2. Handle Cloudflare R2 Image Upload with homeId structuring
+    // 4. Handle Cloudflare R2 Image Upload
     let imageUrl = null;
     if (file && typeof file !== "string" && file.name) {
       imageUrl = await uploadToR2(file, {
@@ -195,14 +339,8 @@ export const createProductSubmission = async (c) => {
       });
     }
 
-    const cleanMobile = mobile.toString().trim();
-    const cleanName = (name || "Member").toString().trim();
-    const targetHomeId = new ObjectId(cleanHomeId);
-    const targetRoomName = (roomName || "Default Room").toString().trim();
-
-    // 3. Database Operations
+    // 5. Database Operations
     const result = await withDatabase(mongoUri, async (db) => {
-      const usersCol = db.collection("users");
       const homesCol = db.collection("homes");
       const roomsCol = db.collection("rooms");
       const devicesCol = db.collection("devices");
@@ -215,47 +353,15 @@ export const createProductSubmission = async (c) => {
         throw new Error("HOME_NOT_FOUND");
       }
 
-      // STEP B: Upsert User & Link to Unified User Schema
-      const numMobile = Number(cleanMobile);
-      const user = await usersCol.findOneAndUpdate(
-        {
-          $or: [
-            { mobile: cleanMobile },
-            { mobile: isNaN(numMobile) ? cleanMobile : numMobile }
-          ]
-        },
-        {
-          $setOnInsert: {
-            name: cleanName,
-            mobile: cleanMobile,
-            createdAt: now,
-            UserInfo: {
-              name: cleanName,
-              phoneNo: cleanMobile,
-              role: "member"
-            },
-            PlatformInfo: {
-              devices: []
-            }
-          },
-          $set: { updatedAt: now }
-        },
-        { upsert: true, returnDocument: "after" }
-      );
-
-      // Link user to home members array
+      // Ensure user is in home's member list
       await homesCol.updateOne(
         { _id: targetHomeId },
         {
-          $addToSet: {
-            members: user._id,
-            memberIds: user._id
-          },
-          $set: { updatedAt: now }
+          $addToSet: {             members: userId,             memberIds: userId           },$set: { updatedAt: now }
         }
       );
 
-      // STEP C: Find or Create Room on demand
+      // STEP B: Find or Create Room on Demand
       const escapedRoomName = targetRoomName.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&");
       let room = await roomsCol.findOne({
         $or: [
@@ -275,18 +381,19 @@ export const createProductSubmission = async (c) => {
         room = { _id: newRoomResult.insertedId, roomName: targetRoomName };
       }
 
-      // STEP D: Create Device Entry
-      const deviceId = `DEV-${Date.now()}-${crypto.randomBytes(2).toString("hex").toUpperCase()}`;
+      // STEP C: Create Device Record
+      const newDeviceId = `DEV-${Date.now()}-${crypto.randomBytes(2).toString("hex").toUpperCase()}`;
 
       const newDevice = {
-        deviceId: deviceId,
+        deviceId: newDeviceId,
         homeId: targetHomeId,
         roomId: room._id,
         product: product.toString().trim(),
         brand: brand.toString().trim(),
         warranty: warranty || null,
         imageUrl: imageUrl,
-        addedByUserId: user._id,
+        addedByUserId: userId,
+        addedByUserMobile: cleanMobile,
         createdAt: now,
         updatedAt: now
       };
@@ -294,12 +401,12 @@ export const createProductSubmission = async (c) => {
       const deviceInsertResult = await devicesCol.insertOne(newDevice);
 
       return {
-        deviceId: deviceId,
+        deviceId: newDeviceId,
         deviceDbId: deviceInsertResult.insertedId,
         homeId: targetHomeId,
         roomId: room._id,
         roomName: room.roomName,
-        userId: user._id,
+        userId: userId,
         imageUrl: imageUrl
       };
     });
@@ -320,8 +427,6 @@ export const createProductSubmission = async (c) => {
     return c.json({ success: false, message: "Internal Server Error", error: error.message }, 500);
   }
 };
-
-
 
 export const updateEntity = async (c) => {
   try {
@@ -507,12 +612,6 @@ export const updateEntity = async (c) => {
 };
 
 
-
-// Helper function — extracts a 6-digit pincode from an address string
-function extractPincodeFromAddress(address) {
-  const match = address?.match(/\b\d{6}\b/);
-  return match ? match[0] : null;
-}
 
 export const addMember = async (c) => {
   try {

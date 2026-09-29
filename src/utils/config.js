@@ -13,10 +13,11 @@ const getConnectedClient = async (uri) => {
 
   // 2. If a connection is not already in progress, initialize the promise
   if (!clientPromise) {
-    console.log("🐘 MongoDB: Initializing Persistent Connection Pool for Zhini...");
+    console.log("🐘 AWS: Initializing Persistent MongoDB Connection Pool...");
     const newClient = new MongoClient(uri, {
       maxPoolSize: 10,
       minPoolSize: 2,
+      // Recommended for stable Atlas connections on AWS/Docker
       connectTimeoutMS: 5000,
       socketTimeoutMS: 45000,
       serverSelectionTimeoutMS: 5000,
@@ -41,7 +42,8 @@ const getConnectedClient = async (uri) => {
 export const withDatabase = async (uri, callback) => {
   try {
     const activeClient = await getConnectedClient(uri);
-    const db = activeClient.db("zhini-dev");
+    
+    const db = activeClient.db(); 
     
     return await callback(db);
     
