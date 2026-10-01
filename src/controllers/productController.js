@@ -430,6 +430,13 @@ export const createProductSubmission = async (c) => {
 
 export const updateEntity = async (c) => {
   try {
+    // 🛡️ 1. Enforce authenticated session context
+    const currentUser = c.get("user");
+    if (!currentUser) {
+      return c.json({ success: false, message: "Unauthorized: Active session required." }, 401);
+    }
+    const currentUserId = currentUser._id;
+
     const body = await c.req.json().catch(async () => await c.req.parseBody());
 
     const {
@@ -447,7 +454,7 @@ export const updateEntity = async (c) => {
       warranty
     } = body;
 
-    // Validation: homeId is the primary root anchor
+    // 2. Validate mandatory root anchor
     if (!homeId) {
       return c.json({
         success: false,
@@ -462,21 +469,30 @@ export const updateEntity = async (c) => {
       }, 400);
     }
 
-    const targetHomeId = new ObjectId(homeId);
+    const cleanHomeIdStr = homeId.toString().trim();
+    const targetHomeId = new ObjectId(cleanHomeIdStr);
 
-    const result = await withDatabase(mongoUri, async (db) => {
+    const result = await withDatabase(process.env.MONGODB_URI, async (db) => {
       const homesCol = db.collection("homes");
       const usersCol = db.collection("users");
       const roomsCol = db.collection("rooms");
       const devicesCol = db.collection("devices");
 
-      // 1. Verify Home exists and identify linked owner
-      const homeDoc = await homesCol.findOne({ _id: targetHomeId });
+      // 3. Verify Home exists AND ensure current user is an owner or member
+      const homeDoc = await homesCol.findOne({
+        _id: targetHomeId,
+        $or: [
+          { ownerId: currentUserId },
+          { members: currentUserId },
+          { memberIds: currentUserId }
+        ]
+      });
+
       if (!homeDoc) {
-        throw new Error("HOME_NOT_FOUND");
+        throw new Error("HOME_FORBIDDEN_OR_NOT_FOUND");
       }
 
-      let updatedSummary = {
+      const updatedSummary = {
         homeUpdated: false,
         userUpdated: false,
         roomUpdated: false,
@@ -487,12 +503,12 @@ export const updateEntity = async (c) => {
 
       const now = new Date().toISOString();
 
-      // 2. Optional: Edit Home Details (homeName, address, pincode)
+      // 4. Update Home Details
       if (homeName !== undefined || address !== undefined || pincode !== undefined) {
         const homeUpdates = { updatedAt: now };
-        if (homeName !== undefined) homeUpdates.homeName = homeName.trim();
-        if (address !== undefined) homeUpdates.address = address.trim();
-        if (pincode !== undefined) homeUpdates.pincode = pincode.trim();
+        if (homeName !== undefined) homeUpdates.homeName = homeName.toString().trim();
+        if (address !== undefined) homeUpdates.address = address.toString().trim();
+        if (pincode !== undefined) homeUpdates.pincode = pincode.toString().trim();
 
         const homeRes = await homesCol.updateOne(
           { _id: targetHomeId },
@@ -501,13 +517,12 @@ export const updateEntity = async (c) => {
         updatedSummary.homeUpdated = homeRes.modifiedCount > 0;
       }
 
-      // 3. Optional: Edit User Details (name, mobile, UserInfo)
-      const linkedUserId = homeDoc.ownerId || homeDoc.userId || (homeDoc.members && homeDoc.members[0]);
-      if (linkedUserId && (name !== undefined || mobile !== undefined)) {
+      // 5. Update User Profile Details (for the authenticated user)
+      if (name !== undefined || mobile !== undefined) {
         const userUpdates = { updatedAt: now };
 
         if (name !== undefined) {
-          const cleanName = name.trim();
+          const cleanName = name.toString().trim();
           userUpdates.name = cleanName;
           userUpdates["UserInfo.name"] = cleanName;
         }
@@ -518,9 +533,9 @@ export const updateEntity = async (c) => {
           userUpdates["UserInfo.phoneNo"] = cleanMobile;
         }
 
-        const userQuery = ObjectId.isValid(linkedUserId)
-          ? { _id: new ObjectId(linkedUserId) }
-          : { _id: linkedUserId };
+        const userQuery = ObjectId.isValid(currentUserId)
+          ? { _id: new ObjectId(currentUserId) }
+          : { _id: currentUserId };
 
         const userRes = await usersCol.updateOne(
           userQuery,
@@ -529,34 +544,31 @@ export const updateEntity = async (c) => {
         updatedSummary.userUpdated = userRes.modifiedCount > 0;
       }
 
-      // 4. Room Management: Update existing OR Add new Room
+      // 6. Room Management: Update existing OR Add new Room
       if (roomName) {
-        const cleanRoomName = roomName.trim();
-
+        const cleanRoomName = roomName.toString().trim();
         let existingRoom = null;
 
         if (roomId && ObjectId.isValid(roomId)) {
           existingRoom = await roomsCol.findOne({
-            _id: new ObjectId(roomId),
-            $or: [{ homeId: targetHomeId }, { homeId: targetHomeId.toString() }]
+            _id: new ObjectId(roomId.toString().trim()),
+            $or: [{ homeId: targetHomeId }, { homeId: cleanHomeIdStr }]
           });
         } else {
-          // If roomId is not supplied, check if a room with this name already exists in this home
+          const escapedName = cleanRoomName.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&");
           existingRoom = await roomsCol.findOne({
-            $or: [{ homeId: targetHomeId }, { homeId: targetHomeId.toString() }],
-            roomName: { $regex: new RegExp(`^${cleanRoomName}$`, "i") }
+            $or: [{ homeId: targetHomeId }, { homeId: cleanHomeIdStr }],
+            roomName: { $regex: new RegExp(`^${escapedName}$`, "i") }
           });
         }
 
         if (existingRoom) {
-          // Update existing room
           const roomRes = await roomsCol.updateOne(
             { _id: existingRoom._id },
             { $set: { roomName: cleanRoomName, updatedAt: now } }
           );
           updatedSummary.roomUpdated = roomRes.modifiedCount > 0;
         } else {
-          // Add brand-new room linked to this home
           const insertRoomRes = await roomsCol.insertOne({
             homeId: targetHomeId,
             roomName: cleanRoomName,
@@ -568,24 +580,34 @@ export const updateEntity = async (c) => {
         }
       }
 
-      // 5. Optional: Edit Device Details
+      // 7. Update Device Details (Bug fixed: Wrapped in $and to prevent duplicate$or key collision)
       if (deviceId && (product !== undefined || brand !== undefined || warranty !== undefined)) {
         const deviceUpdates = { updatedAt: now };
-        if (product !== undefined) deviceUpdates.product = product.trim();
-        if (brand !== undefined) deviceUpdates.brand = brand.trim();
+        if (product !== undefined) deviceUpdates.product = product.toString().trim();
+        if (brand !== undefined) deviceUpdates.brand = brand.toString().trim();
         if (warranty !== undefined) deviceUpdates.warranty = warranty;
 
+        const cleanDeviceIdStr = deviceId.toString().trim();
+
+        const deviceFilter = {
+          $and: [
+            {
+              $or: [
+                { deviceId: cleanDeviceIdStr },
+                ...(ObjectId.isValid(cleanDeviceIdStr) ? [{ _id: new ObjectId(cleanDeviceIdStr) }] : [])
+              ]
+            },
+            {
+              $or: [
+                { homeId: targetHomeId },
+                { homeId: cleanHomeIdStr }
+              ]
+            }
+          ]
+        };
+
         const deviceRes = await devicesCol.updateOne(
-          {
-            $or: [
-              { deviceId: deviceId },
-              ObjectId.isValid(deviceId) ? { _id: new ObjectId(deviceId) } : { deviceId: deviceId }
-            ],
-            $or: [
-              { homeId: targetHomeId },
-              { homeId: targetHomeId.toString() }
-            ]
-          },
+          deviceFilter,
           { $set: deviceUpdates }
         );
         updatedSummary.deviceUpdated = deviceRes.modifiedCount > 0;
@@ -603,8 +625,11 @@ export const updateEntity = async (c) => {
   } catch (error) {
     console.error("❌ Update Entity Controller Error:", error);
 
-    if (error.message === "HOME_NOT_FOUND") {
-      return c.json({ success: false, message: "No home record found with the provided homeId." }, 404);
+    if (error.message === "HOME_FORBIDDEN_OR_NOT_FOUND") {
+      return c.json({
+        success: false,
+        message: "Home record not found or you do not have permission to modify it."
+      }, 403);
     }
 
     return c.json({ success: false, message: "Internal Server Error", error: error.message }, 500);
@@ -999,9 +1024,6 @@ export const deleteRoom = async (c) => {
 };
 
 
-
-
-
 const GEMINI_KEYS = [
   process.env.KEY_1,
   process.env.KEY_2,
@@ -1319,3 +1341,195 @@ export const getSubmissionByMobile = async (c) => {
 };
 
 
+
+export const shiftDevices = async (c) => {
+  try {
+    // 1. Authenticated user from requireAuth middleware
+    const currentUser = c.get("user");
+    if (!currentUser) {
+      return c.json({ success: false, message: "Unauthorized: Active session required." }, 401);
+    }
+    const currentUserId = currentUser._id;
+
+    // 2. Parse request body
+    const body = await c.req.json().catch(async () => await c.req.parseBody());
+    const {
+      deviceIds,        // Array of deviceId strings (e.g., ["DEV-..."]) or string ObjectId
+      sourceRoomId,     // Optional: Shift all devices from this room
+      sourceHomeId,     // Optional: Shift all devices from this home
+      targetHomeId,     // Required: Target home
+      targetRoomId,     // Optional: Specific destination room ID
+      targetRoomName    // Optional: Target room name (finds or auto-creates room)
+    } = body;
+
+    // 3. Validation
+    if (!targetHomeId || !ObjectId.isValid(targetHomeId)) {
+      return c.json({ success: false, message: "A valid targetHomeId is required." }, 400);
+    }
+
+    const hasSpecificDevices = Array.isArray(deviceIds) && deviceIds.length > 0;
+    const hasSourceScope = Boolean(sourceRoomId || sourceHomeId);
+
+    if (!hasSpecificDevices && !hasSourceScope) {
+      return c.json({
+        success: false,
+        message: "Specify either 'deviceIds' array, 'sourceRoomId', or 'sourceHomeId' to shift."
+      }, 400);
+    }
+
+    const cleanTargetHomeId = new ObjectId(targetHomeId.toString().trim());
+
+    // 4. Database Operations
+    const result = await withDatabase(process.env.MONGODB_URI, async (db) => {
+      const homesCol = db.collection("homes");
+      const roomsCol = db.collection("rooms");
+      const devicesCol = db.collection("devices");
+      const now = new Date().toISOString();
+
+      // STEP A: Verify user has access to target home
+      const targetHome = await homesCol.findOne({
+        _id: cleanTargetHomeId,
+        $or: [
+          { ownerId: currentUserId },
+          { members: currentUserId },
+          { memberIds: currentUserId }
+        ]
+      });
+
+      if (!targetHome) {
+        throw new Error("TARGET_HOME_FORBIDDEN_OR_NOT_FOUND");
+      }
+
+      // STEP B: Resolve Target Room (by targetRoomId or targetRoomName)
+      let resolvedTargetRoomId = null;
+      let resolvedTargetRoomName = "";
+
+      if (targetRoomId && ObjectId.isValid(targetRoomId)) {
+        const roomDoc = await roomsCol.findOne({
+          _id: new ObjectId(targetRoomId.toString().trim()),
+          $or: [
+            { homeId: cleanTargetHomeId },
+            { homeId: cleanTargetHomeId.toString() }
+          ]
+        });
+
+        if (!roomDoc) {
+          throw new Error("TARGET_ROOM_NOT_FOUND");
+        }
+        resolvedTargetRoomId = roomDoc._id;
+        resolvedTargetRoomName = roomDoc.roomName;
+      } else if (targetRoomName) {
+        const cleanName = targetRoomName.toString().trim();
+        const escapedName = cleanName.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&");
+
+        let roomDoc = await roomsCol.findOne({
+          $or: [
+            { homeId: cleanTargetHomeId },
+            { homeId: cleanTargetHomeId.toString() }
+          ],
+          roomName: { $regex: new RegExp(`^${escapedName}$`, "i") }
+        });
+
+        if (!roomDoc) {
+          const newRoomResult = await roomsCol.insertOne({
+            homeId: cleanTargetHomeId,
+            roomName: cleanName,
+            createdAt: now,
+            updatedAt: now
+          });
+          resolvedTargetRoomId = newRoomResult.insertedId;
+          resolvedTargetRoomName = cleanName;
+        } else {
+          resolvedTargetRoomId = roomDoc._id;
+          resolvedTargetRoomName = roomDoc.roomName;
+        }
+      } else {
+        return { error: "TARGET_ROOM_REQUIRED" };
+      }
+
+      // STEP C: Build match query for devices to shift
+      const deviceQuery = {};
+
+      if (hasSpecificDevices) {
+        // Support both custom device string IDs ('DEV-...') and MongoDB ObjectIds
+        const objectIdCandidates = deviceIds
+          .filter((id) => ObjectId.isValid(id))
+          .map((id) => new ObjectId(id));
+
+        deviceQuery.$or = [
+          { deviceId: { $in: deviceIds } },
+          { _id: { $in: objectIdCandidates } }
+        ];
+      } else if (sourceRoomId) {
+        const cleanSourceRoomId = ObjectId.isValid(sourceRoomId)
+          ? new ObjectId(sourceRoomId)
+          : sourceRoomId;
+
+        deviceQuery.$or = [
+          { roomId: cleanSourceRoomId },
+          { roomId: cleanSourceRoomId.toString() }
+        ];
+      } else if (sourceHomeId) {
+        const cleanSourceHomeId = ObjectId.isValid(sourceHomeId)
+          ? new ObjectId(sourceHomeId)
+          : sourceHomeId;
+
+        deviceQuery.$or = [
+          { homeId: cleanSourceHomeId },
+          { homeId: cleanSourceHomeId.toString() }
+        ];
+      }
+
+      // STEP D: Execute update
+      const updatePayload = {
+        $set: {
+          homeId: cleanTargetHomeId,
+          roomId: resolvedTargetRoomId,
+          updatedAt: now
+        }
+      };
+
+      const updateResult = await devicesCol.updateMany(deviceQuery, updatePayload);
+
+      return {
+        matchedCount: updateResult.matchedCount,
+        modifiedCount: updateResult.modifiedCount,
+        targetHomeId: cleanTargetHomeId,
+        targetRoomId: resolvedTargetRoomId,
+        targetRoomName: resolvedTargetRoomName
+      };
+    });
+
+    if (result.error === "TARGET_ROOM_REQUIRED") {
+      return c.json({
+        success: false,
+        message: "A target room is required. Provide either 'targetRoomId' or 'targetRoomName'."
+      }, 400);
+    }
+
+    return c.json({
+      success: true,
+      message: `Successfully shifted ${result.modifiedCount} device(s).`,
+      data: result
+    }, 200);
+
+  } catch (error) {
+    console.error("❌ Shift Devices Controller Error:", error);
+
+    if (error.message === "TARGET_HOME_FORBIDDEN_OR_NOT_FOUND") {
+      return c.json({
+        success: false,
+        message: "Target home does not exist or you do not have permission to access it."
+      }, 403);
+    }
+
+    if (error.message === "TARGET_ROOM_NOT_FOUND") {
+      return c.json({
+        success: false,
+        message: "The specified targetRoomId was not found in the target home."
+      }, 404);
+    }
+
+    return c.json({ success: false, message: "Internal Server Error", error: error.message }, 500);
+  }
+};

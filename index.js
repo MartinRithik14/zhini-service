@@ -56,23 +56,7 @@ app.use('*', cors());
 app.get('/', (c) => c.json({ status: 'ok', message: 'ZHINI API Live' }));
 
 // 🛡️ Global Auth Gatekeeper Middleware
-app.use("*", async (c, next) => {
-  const path = c.req.path;
-  const method = c.req.method;
 
-  // Exact public endpoints permitted without internal session headers:
-  const isMetrics = (path === '/metrics' || path === '/metrics/') && method === 'GET';
-  const isCrashLogger = (path === '/crash/add' || path.startsWith('/crash')) && method === 'POST';
-  const userOnboardEndpoint = (path === '/product/home' || path === '/product/home/') && method === 'POST';
-  const userSessionEndpoint = (path === '/product/session' || path === '/product/session/') && method === 'POST';
-
-  if (isMetrics || isCrashLogger || userOnboardEndpoint || userSessionEndpoint) {
-    return next();
-  }
-
-  // Enforce MongoDB session verification on everything else
-  return requireAuth(c, next);
-});
 
 app.route('/product', productRouter);
 app.route('/service', serviceRouter);
