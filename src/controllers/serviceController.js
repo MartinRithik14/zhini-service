@@ -6,7 +6,8 @@ import { uploadToR2 } from "../services/r2.service.js";
 import { createServiceCard, moveCardToList, createProviderBoard,getWekanAuthHeaders } from '../services/wekan.js';
 
 const mongoUri = process.env.MONGODB_URI;
-const CACHE_EXPIRATION_MS = 24 * 60 * 60 * 1000; // 24 Hours in milliseconds
+// 1 Month / 30 Days (new)
+const CACHE_EXPIRATION_MS = 30 * 24 * 60 * 60 * 1000; //One month cache 
 
 
 const getCoordinatesFromLocation = async (address, pincode) => {

@@ -1024,82 +1024,149 @@ export const deleteRoom = async (c) => {
 };
 
 
-const GEMINI_KEYS = [
+const FREE_GEMINI_KEYS = [
   process.env.KEY_1,
   process.env.KEY_2,
   process.env.KEY_3,
 ].filter(Boolean);
 
-let currentGeminiKeyIndex = 0;
+let currentFreeKeyIndex = 0;
+
+// 2. Production Master Pay-As-You-Go Key
+const MASTER_GEMINI_KEY = process.env.GEMINI_MASTER_KEY;
+
+// 3. Whitelisted Test Mobile Numbers (Normalized 10 digits)
+const TEST_NUMBERS = new Set([
+  "1111111111",
+  "2222222222",
+  "3333333333",
+  "4444444444",
+  "5555555555"
+]);
 
 export const AIassist = async (c) => {
   try {
-    const { imageBase64, mimeType = "image/jpeg" } = await c.req.json();
+    const { imageBase64, mimeType = "image/jpeg", mobile: bodyMobile } = await c.req.json();
 
     if (!imageBase64) {
       return c.json({ success: false, message: "No imageBase64 provided" }, 400);
     }
 
-    if (GEMINI_KEYS.length === 0) {
-      return c.json({ success: false, message: "No API keys configured" }, 500);
-    }
+    // 4. Resolve and normalize caller's phone number
+    const currentUser = c.get("user");
+    const rawMobile =
+      currentUser?.mobile ||
+      currentUser?.UserInfo?.phoneNo ||
+      c.get("userMobile") ||
+      c.req.header("x-user-phone") ||
+      c.req.header("x-phone-no") ||
+      bodyMobile ||
+      "";
+
+    // Strip out non-digit characters and standard prefixes (e.g. +91 or leading 0)
+    const cleanMobile = rawMobile
+      .toString()
+      .replace(/\D/g, "")
+      .replace(/^91(?=\d{10}$)/, "");
+
+    const isTestUser = TEST_NUMBERS.has(cleanMobile);
 
     const promptText =
       "Identify the appliance in this image. Return ONLY a raw JSON object with exactly two keys: 'brand' and 'product'. Example: {\"brand\": \"Samsung\", \"product\": \"Washing Machine\"}";
 
     let responseText;
-    let geminiAttempts = 0;
 
-    // Cycle through available Gemini API keys on failure
-    while (geminiAttempts < GEMINI_KEYS.length) {
-      const apiKey = GEMINI_KEYS[currentGeminiKeyIndex];
+    // -------------------------------------------------------------
+    // SCENARIO A: REAL / PRODUCTION USER -> Master Key (Pay-As-You-Go)
+    // -------------------------------------------------------------
+    if (!isTestUser) {
+      if (!MASTER_GEMINI_KEY) {
+        console.error("❌ Master Gemini API key is missing from environment variables.");
+        return c.json({ success: false, message: "Service temporarily unavailable: Master API key not configured." }, 500);
+      }
 
-      try {
-        console.log(`🤖 Attempting Gemini execution with Key index: ${currentGeminiKeyIndex}`);
-        const ai = new GoogleGenAI({ apiKey });
+      console.log(`💳 Production User (${cleanMobile || "Unknown"}): Routing to Pay-As-You-Go Master Key`);
+      const ai = new GoogleGenAI({ apiKey: MASTER_GEMINI_KEY });
 
-        const response = await ai.models.generateContent({
-          model: "gemini-2.5-flash",
-          contents: [
-            {
-              inlineData: {
-                mimeType: mimeType,
-                data: imageBase64,
-              },
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: [
+          {
+            inlineData: {
+              mimeType: mimeType,
+              data: imageBase64,
             },
-            promptText, // Text prompt passed alongside inlineData
-          ],
-          config: {
-            responseMimeType: "application/json",
           },
-        });
+          promptText,
+        ],
+        config: {
+          responseMimeType: "application/json",
+        },
+      });
 
-        responseText = response.text;
-        console.log("✅ Gemini execution successful!");
-        break; // Exit loop on success
-      } catch (err) {
-        console.warn(`⚠️ Gemini key index ${currentGeminiKeyIndex} failed: ${err.message}. Rotating key...`);
-        geminiAttempts++;
-        currentGeminiKeyIndex = (currentGeminiKeyIndex + 1) % GEMINI_KEYS.length;
+      responseText = response.text;
+    } 
+    // -------------------------------------------------------------
+    // SCENARIO B: TEST USER (1111111111 - 5555555555) -> Rotating Free Keys
+    // -------------------------------------------------------------
+    else {
+      if (FREE_GEMINI_KEYS.length === 0) {
+        return c.json({ success: false, message: "No free-tier testing API keys configured" }, 500);
+      }
+
+      console.log(`🧪 Test User (${cleanMobile}): Routing to Free-Tier Rotating Keys`);
+      let geminiAttempts = 0;
+
+      while (geminiAttempts < FREE_GEMINI_KEYS.length) {
+        const apiKey = FREE_GEMINI_KEYS[currentFreeKeyIndex];
+
+        try {
+          console.log(`🤖 Attempting Free Gemini Key at index: ${currentFreeKeyIndex}`);
+          const ai = new GoogleGenAI({ apiKey });
+
+          const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: [
+              {
+                inlineData: {
+                  mimeType: mimeType,
+                  data: imageBase64,
+                },
+              },
+              promptText,
+            ],
+            config: {
+              responseMimeType: "application/json",
+            },
+          });
+
+          responseText = response.text;
+          console.log("✅ Free Gemini Key execution successful!");
+          break; // Exit loop on success
+        } catch (err) {
+          console.warn(`⚠️️ Free Gemini key index ${currentFreeKeyIndex} failed: ${err.message}. Rotating key...`);
+          geminiAttempts++;
+          currentFreeKeyIndex = (currentFreeKeyIndex + 1) % FREE_GEMINI_KEYS.length;
+        }
+      }
+
+      if (!responseText) {
+        return c.json(
+          { success: false, message: "All free Gemini API keys failed or quota exceeded." },
+          429
+        );
       }
     }
 
-    // Exhausted all key attempts
-    if (!responseText) {
-      return c.json(
-        { success: false, message: "All Gemini API keys failed or quota exceeded." },
-        429
-      );
-    }
-
-    // Safely parse JSON response
+    // 5. Parse and return result
     const cleanedText = responseText.replace(/```json|```/g, "").trim();
     const parsedResult = JSON.parse(cleanedText);
 
     return c.json({
       success: true,
       data: parsedResult,
-    });
+    }, 200);
+
   } catch (error) {
     console.error("❌ AI Assist Error:", error.message);
     return c.json(
