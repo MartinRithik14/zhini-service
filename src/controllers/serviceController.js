@@ -1,6 +1,7 @@
-import { withDatabase } from '../utils/config.js';
-import { scrapeServiceCenters, scrapeHomeServices } from '../services/scrapeService.js';
 import 'dotenv/config';
+import { withDatabase } from '../utils/config.js';
+import{ sendPushNotification }  from '../utils/fcmHelper.js';
+import { scrapeServiceCenters, scrapeHomeServices } from '../services/scrapeService.js';
 import { ObjectId } from "mongodb";
 import { uploadToR2 } from "../services/r2.service.js";
 import { createServiceCard, moveCardToList, createProviderBoard,getWekanAuthHeaders } from '../services/wekan.js';
@@ -447,7 +448,6 @@ export const createServiceProvider = async (c) => {
   }
 };
 
-
 export const createServiceTicket = async (c) => {
   try {
     let body = {};
@@ -474,19 +474,36 @@ export const createServiceTicket = async (c) => {
       }, 400);
     }
 
+    const cleanProviderMobile = providerMobile.toString().trim();
+    let targetFcmTokens = [];
+
     const ticketResult = await withDatabase(mongoUri, async (db) => {
+      const usersCollection = db.collection("users");
       const providerCollection = db.collection("service-providers");
       const wekanServiceCollection = db.collection("wekan-services");
 
-      const cleanProviderMobile = providerMobile.trim();
+      // 1. Fetch provider user record from 'users' to extract FCM tokens
+      const providerUser = await usersCollection.findOne({
+        $or: [
+          { mobile: cleanProviderMobile },
+          { "UserInfo.phoneNo": cleanProviderMobile }
+        ]
+      });
 
-      // 1. Fetch Provider record to get board context
+      if (providerUser?.PlatformInfo?.devices && Array.isArray(providerUser.PlatformInfo.devices)) {
+        // Collect all active fcmTokens (or prioritize isLastLoggedIn)
+        targetFcmTokens = providerUser.PlatformInfo.devices
+          .map((d) => d.fcmToken)
+          .filter(Boolean);
+      }
+
+      // 2. Fetch Provider record to get board context
       let provider = await providerCollection.findOne({ mobile: cleanProviderMobile });
 
       let boardId = provider?.wekanBoardId;
       let newListId = provider?.wekanLists?.["New"];
 
-      // 2. Fallback: If board or list mapping is missing, provision new board and sync back to MongoDB
+      // 3. Fallback: If board or list mapping is missing, provision new board and sync back
       if (!boardId || !newListId) {
         console.warn(`⚠️ Board info missing for provider '${cleanProviderMobile}'. Provisioning now...`);
         const boardResult = await createProviderBoard(cleanProviderMobile);
@@ -507,7 +524,7 @@ export const createServiceTicket = async (c) => {
         }
       }
 
-      // 3. Format details and create card in Wekan under Customer Phone Swimlane
+      // 4. Format details and create card in Wekan
       const cardTitle = `Ticket: ${customerName.trim()} (${custNumber.trim()})`;
       const cardDescription = `Customer Name: ${customerName.trim()}\nCustomer Phone: ${custNumber.trim()}\nAddress: ${address.trim()}\nAvailable Time: ${availableTime}\nDescription: ${description.trim()}`;
 
@@ -517,7 +534,7 @@ export const createServiceTicket = async (c) => {
         customerPhone: custNumber.trim(),
       });
 
-      // 4. Save ticket document in 'wekan-services' collection
+      // 5. Save ticket document in 'wekan-services' collection
       const ticketRecord = {
         ticketId: `TICK-${Date.now()}`,
         assignedTo: cleanProviderMobile,
@@ -544,6 +561,20 @@ export const createServiceTicket = async (c) => {
       return ticketRecord;
     });
 
+    // 6. Non-blocking push notification dispatch
+    if (targetFcmTokens.length > 0) {
+      sendPushNotification(targetFcmTokens, {
+        title: "New Service Request! 🛠️",
+        body: `${customerName.trim()} requested a service at ${address.trim()}.`,
+        data: {
+          type: "SERVICE_TICKET",
+          ticketId: ticketResult.ticketId,
+          customerName: customerName.trim(),
+          customerPhone: custNumber.trim(),
+        },
+      }).catch((err) => console.error("⚠️ Background FCM Dispatch failed:", err));
+    }
+
     return c.json({
       success: true,
       message: "Ticket created and assigned to service provider.",
@@ -560,8 +591,6 @@ export const createServiceTicket = async (c) => {
     }, 500);
   }
 };
-
-
 
 
 export const getProviderTickets = async (c) => {
@@ -603,7 +632,6 @@ export const getProviderTickets = async (c) => {
     }, 500);
   }
 };
-
 
 
 const STATUS_TO_WEKAN_LIST = {
