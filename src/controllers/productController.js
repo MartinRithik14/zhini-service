@@ -636,7 +636,142 @@ export const updateEntity = async (c) => {
   }
 };
 
+// Helper to safely parse MongoDB ObjectIds or keep string identifier
+const toMongoId = (id) => {
+  if (!id) return null;
+  return ObjectId.isValid(id) ? new ObjectId(id) : id;
+};
 
+export const commonDelete = async (c) => {
+  try {
+    let body = {};
+    try {
+      body = await c.req.json();
+    } catch (_) {
+      body = await c.req.parseBody();
+    }
+
+    const type = (body.type || c.req.query("type") || "").toUpperCase().trim();
+    const targetId = body.id || body.targetId || c.req.query("id");
+    const homeId = body.homeId || c.req.query("homeId");
+
+    if (!type || !targetId) {
+      return c.json({
+        success: false,
+        message: "Missing required parameters: 'type' (PRODUCT, ROOM, MEMBER) and 'id' are required.",
+      }, 400);
+    }
+
+    const result = await withDatabase(mongoUri, async (db) => {
+      // -------------------------------------------------------------
+      // 1. DELETE PRODUCT / APPLIANCE
+      // -------------------------------------------------------------
+      if (type === "PRODUCT" || type === "DEVICE") {
+        const devicesCollection = db.collection("devices");
+        const queueCollection = db.collection("notification_queue");
+
+        const query = ObjectId.isValid(targetId)
+          ? { $or: [{ _id: new ObjectId(targetId) }, { deviceId: targetId }] }
+          : { deviceId: targetId };
+
+        const deleted = await devicesCollection.deleteOne(query);
+
+        if (deleted.deletedCount === 0) {
+          return { found: false, message: "Product/Device not found" };
+        }
+
+        // Clean up pending warranty notifications for this device
+        await queueCollection.deleteMany({
+          $or: [{ deviceId: targetId }, { deviceId: String(targetId) }],
+          status: "PENDING",
+        });
+
+        return { found: true, message: "Product and pending warranty alerts deleted successfully" };
+      }
+
+      // -------------------------------------------------------------
+      // 2. DELETE ROOM
+      // -------------------------------------------------------------
+      if (type === "ROOM") {
+        const roomsCollection = db.collection("rooms");
+        const devicesCollection = db.collection("devices");
+
+        const roomQuery = ObjectId.isValid(targetId)
+          ? { _id: new ObjectId(targetId) }
+          : { roomId: targetId };
+
+        const deleted = await roomsCollection.deleteOne(roomQuery);
+
+        if (deleted.deletedCount === 0) {
+          return { found: false, message: "Room not found" };
+        }
+
+        // Decoupled cascade: Unassign any devices mapped to this room
+        await devicesCollection.updateMany(
+          { $or: [{ roomId: targetId }, { roomId: toMongoId(targetId) }] },
+          { $unset: { roomId: "", roomName: "" } }
+        );
+
+        return { found: true, message: "Room deleted and assigned appliances detached successfully" };
+      }
+
+      // -------------------------------------------------------------
+      // 3. DELETE MEMBER (Revoke Home Access)
+      // -------------------------------------------------------------
+      if (type === "MEMBER") {
+        if (!homeId) {
+          return { found: false, validationError: true, message: "homeId is required to remove a member" };
+        }
+
+        const homesCollection = db.collection("homes");
+        const homeQuery = ObjectId.isValid(homeId)
+          ? { _id: new ObjectId(homeId) }
+          : { homeId: homeId };
+
+        // Pull the member reference (handles ObjectId, userId string, or phone)
+        const updateResult = await homesCollection.updateOne(
+          homeQuery,
+          {
+            $pull: {
+              members: {
+                $in: [targetId, toMongoId(targetId), String(targetId)],
+              },
+            },
+          }
+        );
+
+        if (updateResult.matchedCount === 0) {
+          return { found: false, message: "Home not found" };
+        }
+
+        return { found: true, message: "Member access removed from the home successfully" };
+      }
+
+      return { found: false, invalidType: true, message: `Unsupported type: '${type}'. Use PRODUCT, ROOM, or MEMBER.` };
+    });
+
+    if (result.invalidType || result.validationError) {
+      return c.json({ success: false, message: result.message }, 400);
+    }
+
+    if (!result.found) {
+      return c.json({ success: false, message: result.message }, 404);
+    }
+
+    return c.json({
+      success: true,
+      message: result.message,
+    }, 200);
+
+  } catch (error) {
+    console.error("❌ Common Delete Error:", error.message);
+    return c.json({
+      success: false,
+      message: "Internal Server Error during deletion",
+      error: error.message,
+    }, 500);
+  }
+};
 
 export const addMember = async (c) => {
   try {
@@ -785,244 +920,6 @@ export const addMember = async (c) => {
   }
 };
 
-export const deleteMember = async (c) => {
-  try {
-    const body = await c.req.json().catch(async () => await c.req.parseBody()).catch(() => ({}));
-    const homeIdParam = c.req.param("homeId");
-    
-    const homeId = homeIdParam || body.homeId;
-    const mobile = body.mobile;
-
-    if (!homeId || !mobile) {
-      return c.json({
-        success: false,
-        message: "homeId and mobile are required to remove a member."
-      }, 400);
-    }
-
-    const cleanHomeId = homeId.toString().trim();
-    const cleanMobile = mobile.toString().trim();
-
-    if (!ObjectId.isValid(cleanHomeId)) {
-      return c.json({ success: false, message: "Invalid homeId format." }, 400);
-    }
-
-    const targetHomeId = new ObjectId(cleanHomeId);
-    const numMobile = Number(cleanMobile);
-
-    const result = await withDatabase(mongoUri, async (db) => {
-      const usersCol = db.collection("users");
-      const homesCol = db.collection("homes");
-      const now = new Date().toISOString();
-
-      // 1. Find user by mobile
-      const user = await usersCol.findOne({
-        $or: [
-          { mobile: cleanMobile },
-          { mobile: isNaN(numMobile) ? cleanMobile : numMobile }
-        ]
-      });
-
-      if (!user) {
-        return { status: "USER_NOT_FOUND" };
-      }
-
-      // 2. Fetch home to verify owner guardrail
-      const home = await homesCol.findOne({ _id: targetHomeId });
-      if (!home) {
-        return { status: "HOME_NOT_FOUND" };
-      }
-
-      // Prevent removing the primary owner
-      if (home.ownerId && home.ownerId.toString() === user._id.toString()) {
-        return { status: "CANNOT_REMOVE_OWNER" };
-      }
-
-      // 3. Pull user ObjectId from members & memberIds arrays
-      const updateRes = await homesCol.updateOne(
-        { _id: targetHomeId },
-        {
-          $pull: {
-            members: user._id,
-            memberIds: user._id
-          },
-          $set: { updatedAt: now }
-        }
-      );
-
-      if (updateRes.modifiedCount === 0) {
-        return { status: "MEMBER_NOT_IN_HOME" };
-      }
-
-      return { status: "SUCCESS" };
-    });
-
-    if (result.status === "USER_NOT_FOUND" || result.status === "MEMBER_NOT_IN_HOME") {
-      return c.json({ success: false, message: "Member not found in this home." }, 404);
-    }
-
-    if (result.status === "HOME_NOT_FOUND") {
-      return c.json({ success: false, message: "Home record not found." }, 404);
-    }
-
-    if (result.status === "CANNOT_REMOVE_OWNER") {
-      return c.json({ success: false, message: "Primary owner cannot be removed from the home." }, 400);
-    }
-
-    return c.json({
-      success: true,
-      message: "Member removed from household successfully."
-    }, 200);
-
-  } catch (error) {
-    console.error("❌ Delete Member Controller Error:", error);
-    return c.json({ success: false, message: "Internal Server Error", error: error.message }, 500);
-  }
-};
-
-export const deleteRoomProduct = async (c) => {
-  const homeId = c.req.param('homeId');
-  const { roomName, product } = await c.req.json(); // e.g., roomName: "kitchen", product: "Laptop"
-
-  const result = await withDatabase(mongoUri, async (db) => {
-    return await db.collection('homes').updateOne(
-      { _id: new ObjectId(homeId) },
-      {
-        $pull: {
-          [`rooms.${roomName}`]: { product: product } // Dynamic key for room (e.g., rooms.kitchen)
-        },
-        $set: { updatedAt: new Date().toISOString() }
-      }
-    );
-  });
-
-  if (result.modifiedCount === 0) {
-    return c.json({ success: false, message: 'Home, room, or product not found' }, 404);
-  }
-
-  return c.json({ success: true, message: 'Product deleted successfully' });
-};
-
-export const deleteRoom = async (c) => {
-  try {
-    // 1. Extract params/body
-    const paramRoomId = c.req.param("roomId");
-    const body = await c.req.json().catch(async () => await c.req.parseBody().catch(() => ({})));
-    const targetRoomId = paramRoomId || body?.roomId;
-    const targetHomeId = body?.homeId;
-
-    // 2. Input Validations
-    if (!targetRoomId) {
-      return c.json({
-        success: false,
-        message: "Missing required field: roomId is required to delete a room."
-      }, 400);
-    }
-
-    if (!ObjectId.isValid(targetRoomId)) {
-      return c.json({
-        success: false,
-        message: "Invalid roomId format provided."
-      }, 400);
-    }
-
-    if (targetHomeId && !ObjectId.isValid(targetHomeId)) {
-      return c.json({
-        success: false,
-        message: "Invalid homeId format provided."
-      }, 400);
-    }
-
-    const roomObjectId = new ObjectId(targetRoomId);
-
-    // 3. Database Execution
-    const result = await withDatabase(mongoUri, async (db) => {
-      const roomsCol = db.collection("rooms");
-      const homesCol = db.collection("homes");
-      const devicesCol = db.collection("devices");
-
-      // Verify room exists (optionally scoped to homeId if provided)
-      const roomQuery = { _id: roomObjectId };
-      if (targetHomeId) {
-        const homeObjectId = new ObjectId(targetHomeId);
-        roomQuery.$or = [
-          { homeId: homeObjectId },
-          { homeId: targetHomeId.toString() }
-        ];
-      }
-
-      const roomDoc = await roomsCol.findOne(roomQuery);
-      if (!roomDoc) {
-        throw new Error("ROOM_NOT_FOUND");
-      }
-
-      const linkedHomeId = roomDoc.homeId;
-
-      // Unlink room reference from parent home document if stored in an array
-      if (linkedHomeId) {
-        const homeQuery = ObjectId.isValid(linkedHomeId)
-          ? { _id: new ObjectId(linkedHomeId) }
-          : { _id: linkedHomeId };
-
-        await homesCol.updateOne(homeQuery, {
-          $pull: {
-            rooms: {
-              $in: [roomObjectId, targetRoomId.toString()]
-            }
-          },
-          $set: { updatedAt: new Date().toISOString() }
-        });
-      }
-
-      // Cleanup associated devices inside this room (unassign room or cascade)
-      const deviceCleanupRes = await devicesCol.updateMany(
-        {
-          $or: [
-            { roomId: roomObjectId },
-            { roomId: targetRoomId.toString() }
-          ]
-        },
-        {
-          $unset: { roomId: "" },
-          $set: { updatedAt: new Date().toISOString() }
-        }
-      );
-
-      // Delete the room document
-      const deleteRes = await roomsCol.deleteOne({ _id: roomObjectId });
-
-      return {
-        deleted: deleteRes.deletedCount > 0,
-        roomId: targetRoomId,
-        homeId: linkedHomeId ? linkedHomeId.toString() : null,
-        unlinkedDevicesCount: deviceCleanupRes.modifiedCount
-      };
-    });
-
-    return c.json({
-      success: true,
-      message: "Room deleted successfully.",
-      data: result
-    }, 200);
-
-  } catch (error) {
-    console.error("❌ Delete Room Controller Error:", error);
-
-    if (error.message === "ROOM_NOT_FOUND") {
-      return c.json({
-        success: false,
-        message: "No room record found with the provided roomId."
-      }, 404);
-    }
-
-    return c.json({
-      success: false,
-      message: "Internal Server Error",
-      error: error.message
-    }, 500);
-  }
-};
-
 
 const FREE_GEMINI_KEYS = [
   process.env.KEY_1,
@@ -1114,7 +1011,7 @@ export const AIassist = async (c) => {
     // -------------------------------------------------------------
     else {
       if (FREE_GEMINI_KEYS.length === 0) {
-        return c.json({ success: false, message: "No free-tier testing API keys configured" }, 500);
+        return c.json({ success: false, message: "No free-tier testing API keys configured!!!" }, 500);
       }
 
       console.log(`🧪 Test User (${cleanMobile}): Routing to Free-Tier Rotating Keys`);
@@ -1416,7 +1313,7 @@ export const getSubmissionByMobile = async (c) => {
 };
 
 
-
+//Shift endpoint: Move devices from one home/room to another, or shift specific devices by deviceId
 export const shiftDevices = async (c) => {
   try {
     // 1. Authenticated user from requireAuth middleware

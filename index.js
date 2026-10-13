@@ -3,6 +3,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { serve } from '@hono/node-server';
 import { requireAuth } from "./src/middleware/authMiddleware.js";
+import { rateLimiter } from "./src/middleware/rateLimiter.js"; // 👈 1. Import rate limiter
 import { initializeApp, cert, applicationDefault, getApps } from 'firebase-admin/app';
 import fs from 'fs';
 
@@ -24,7 +25,6 @@ try {
   if (rawKey) {
     const parsedKey = JSON.parse(rawKey);
     firebaseCredential = cert(parsedKey);
-    // 🎯 Dynamically extract the project ID directly from the JSON file:
     detectedProjectId = parsedKey.project_id;
   } else {
     firebaseCredential = applicationDefault();
@@ -50,31 +50,16 @@ import crashRouter from './src/routes/crashRoutes.js';
 
 const app = new Hono();
 
+// 1. CORS first to handle preflight headers
 app.use('*', cors());
 
-// Root health check
+// 2. Health check (kept open for monitoring checks)
 app.get('/', (c) => c.json({ status: 'ok', message: 'ZHINI API Live' }));
 
-// 🛡️ Global Auth Gatekeeper Middleware
-app.use("*", async (c, next) => {
-  const path = c.req.path;
-  const method = c.req.method;
+// 🛑 3. Global Rate Limiter: Protects all subsequent API routes
+app.use('*', rateLimiter);
 
-  // Exact public endpoints permitted without internal session headers:
-  const isMetrics = (path === '/metrics' || path === '/metrics/') && method === 'GET';
-  const isCrashLogger = (path === '/crash/add' || path.startsWith('/crash')) && method === 'POST';
-  const userOnboardEndpoint = (path === '/product/home' || path === '/product/home/') && method === 'POST';
-  const userSessionEndpoint = (path === '/product/session' || path === '/product/session/') && method === 'POST';
-
-  if (isMetrics || isCrashLogger || userOnboardEndpoint || userSessionEndpoint) {
-    return next();
-  }
-
-  // Enforce MongoDB session verification on everything else
-  return requireAuth(c, next);
-});
-
-
+// 🛡️ 4. Global Auth Gatekeeper Middleware
 
 
 app.route('/product', productRouter);
