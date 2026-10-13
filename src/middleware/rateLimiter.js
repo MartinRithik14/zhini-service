@@ -54,7 +54,7 @@ async function getRateLimiterConfig() {
       cachedConfig = DEFAULT_CONFIG;
     }
   } catch (err) {
-    console.error("⚠️ Failed to load rate limiter settings from DB, using fallback:", err.message);
+    console.error("⚠️ Failed to load rate limiter settings from DB, using fallback!!!:", err.message);
     if (!cachedConfig) cachedConfig = DEFAULT_CONFIG;
   }
 
