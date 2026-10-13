@@ -1011,7 +1011,7 @@ export const AIassist = async (c) => {
     // -------------------------------------------------------------
     else {
       if (FREE_GEMINI_KEYS.length === 0) {
-        return c.json({ success: false, message: "No free-tier testing API keys configured" }, 500);
+        return c.json({ success: false, message: "No free-tier testing API keys configured!!!" }, 500);
       }
 
       console.log(`🧪 Test User (${cleanMobile}): Routing to Free-Tier Rotating Keys`);
