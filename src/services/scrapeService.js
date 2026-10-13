@@ -1,6 +1,6 @@
 import axios from "axios";
 
-const GOOGLE_PLACES_API_KEY = "AIzaSyC6gkR4WS2Br3_RNMR6aeWH1cP-hr8u2h0";
+const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY;
 
 export const scrapeServiceCenters = async (brand, product, pincode, options = { authorizedOnly: false }) => {
   try {

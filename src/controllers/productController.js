@@ -1045,6 +1045,8 @@ const TEST_NUMBERS = new Set([
   "9999999999"
 ]);
 
+const GEMINI_MODEL = "gemini-3.8-flash";
+
 export const AIassist = async (c) => {
   try {
     const { imageBase64, mimeType = "image/jpeg", mobile: bodyMobile } = await c.req.json();
@@ -1090,7 +1092,7 @@ export const AIassist = async (c) => {
       const ai = new GoogleGenAI({ apiKey: MASTER_GEMINI_KEY });
 
       const response = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
+        model: GEMINI_MODEL,
         contents: [
           {
             inlineData: {
@@ -1126,7 +1128,7 @@ export const AIassist = async (c) => {
           const ai = new GoogleGenAI({ apiKey });
 
           const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
+            model: GEMINI_MODEL,
             contents: [
               {
                 inlineData: {
@@ -1145,11 +1147,16 @@ export const AIassist = async (c) => {
           console.log("✅ Free Gemini Key execution successful!");
           break; // Exit loop on success
         } catch (err) {
-          console.warn(`⚠️️ Free Gemini key index ${currentFreeKeyIndex} failed: ${err.message}. Rotating key...`);
-          geminiAttempts++;
-          currentFreeKeyIndex = (currentFreeKeyIndex + 1) % FREE_GEMINI_KEYS.length;
-        }
-      }
+  console.warn(`⚠️ Free Gemini key index ${currentFreeKeyIndex} failed: ${err.message}`);
+  const status = err.status || err.code;
+  if (status === 429 || /quota|rate/i.test(err.message)) {
+    geminiAttempts++;
+    currentFreeKeyIndex = (currentFreeKeyIndex + 1) % FREE_GEMINI_KEYS.length;
+  } else {
+    throw err;
+  }
+}
+}
 
       if (!responseText) {
         return c.json(
