@@ -1,0 +1,43 @@
+name: Deploy Zhini Service to Vultr
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (e.g., 1.0.26101402)'
+        required: true
+        default: '1.0.26101402'
+
+jobs:
+  deploy:
+    name: Deploy to Server
+    runs-on: ubuntu-latest
+    if: github.repository == 'zhini-co-in/zhini-service'
+
+    steps:
+      - name: SSH and Deploy Container
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          script: |
+            IMAGE="ghcr.io/zhini-co-in/zhini:${{ github.event.inputs.image_tag }}"
+            echo "Pulling Docker image: $IMAGE"
+            docker pull "$IMAGE"
+
+            echo "Stopping old container if running..."
+            docker stop zhini || true
+            docker rm zhini || true
+
+            echo "Starting new container with tag: ${{ github.event.inputs.image_tag }}..."
+            docker run -d \
+              --name zhini \
+              --restart always \
+              --network app-network \
+              --env-file /opt/apps/zhini/.env \
+              -p 127.0.0.1:5000:5000 \
+              "$IMAGE"
+
+            echo "Deployment finished successfully!"
+            docker ps --filter "name=zhini"
