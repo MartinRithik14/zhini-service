@@ -6,7 +6,6 @@ on:
       image_tag:
         description: 'Image tag to deploy (e.g., 1.0.26101402)'
         required: true
-        default: '1.0.26101402'
 
 jobs:
   deploy:
@@ -38,6 +37,9 @@ jobs:
               --env-file /opt/apps/zhini/.env \
               -p 127.0.0.1:5000:5000 \
               "$IMAGE"
+
+            echo "Cleaning up old unused Docker images..."
+            docker image prune -af
 
             echo "Deployment finished successfully!"
             docker ps --filter "name=zhini"
