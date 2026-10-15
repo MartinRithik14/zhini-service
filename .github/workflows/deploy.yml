@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: 'Image tag to deploy (e.g., 1.0.26101402)'
+        description: 'Image tag to deploy (e.g., 1.0.26101501)'
         required: true
 
 jobs:
@@ -35,6 +35,7 @@ jobs:
               --restart always \
               --network app-network \
               --env-file /opt/apps/zhini/.env \
+              -v /opt/apps/zhini/firebase-key.json:/app/firebase-key.json:ro \
               -p 127.0.0.1:5000:5000 \
               "$IMAGE"
 
