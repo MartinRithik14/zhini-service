@@ -15,6 +15,7 @@
     "firebase-admin": "^14.5.0",
     "hono": "^4.12.9",
     "mongodb": "^7.1.0",
-    "multer": "^2.2.0"
+    "multer": "^2.2.0",
+    "prom-client": "^15.1.3"
   }
 }
