@@ -3,8 +3,9 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { serve } from '@hono/node-server';
 import { requireAuth } from "./src/middleware/authMiddleware.js";
-import { rateLimiter } from "./src/middleware/rateLimiter.js"; // 👈 1. Import rate limiter
+import { rateLimiter } from "./src/middleware/rateLimiter.js";
 import { initializeApp, cert, applicationDefault, getApps } from 'firebase-admin/app';
+import { metricsMiddleware } from "./src/middleware/metrics.js";
 import fs from 'fs';
 
 // 🔑 DYNAMIC SERVICE ACCOUNT INITIALIZATION
@@ -47,6 +48,7 @@ if (!getApps().length) {
 import productRouter from './src/routes/productRoutes.js';
 import serviceRouter from './src/routes/serviceRoutes.js';
 import crashRouter from './src/routes/crashRoutes.js';
+import metricsRoute from './src/routes/metricsRoute.js';
 
 const app = new Hono();
 
@@ -56,10 +58,16 @@ app.use('*', cors());
 // 2. Health check (kept open for monitoring checks)
 app.get('/', (c) => c.json({ status: 'ok', message: 'ZHINI API Live' }));
 
-// 🛑 3. Global Rate Limiter: Protects all subsequent API routes
+// 3. Prometheus Metrics Middleware (observes duration & counts requests)
+app.use("*", metricsMiddleware);
+
+// 4. Mount Prometheus Scraping Endpoint (Before rate limiter & auth)
+app.route("/metrics", metricsRoute);
+
+// 🛑 5. Global Rate Limiter: Protects subsequent API routes
 app.use('*', rateLimiter);
 
-// 🛡️ 4. Global Auth Gatekeeper Middleware
+// 🛡️ 6. Global Auth Gatekeeper Middleware
 app.use("*", async (c, next) => {
   const path = c.req.path;
   const method = c.req.method;
@@ -78,6 +86,7 @@ app.use("*", async (c, next) => {
   return requireAuth(c, next);
 });
 
+// Modular Routes
 app.route('/product', productRouter);
 app.route('/service', serviceRouter);
 app.route('/crash', crashRouter);
