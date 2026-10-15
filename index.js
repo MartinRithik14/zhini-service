@@ -6,6 +6,8 @@ import { requireAuth } from "./src/middleware/authMiddleware.js";
 import { rateLimiter } from "./src/middleware/rateLimiter.js";
 import { initializeApp, cert, applicationDefault, getApps } from 'firebase-admin/app';
 import { metricsMiddleware } from "./src/middleware/metrics.js";
+import { ensureAuditLogIndexes } from "./src/utils/auditLogger.js";
+import { auditHttpMiddleware } from "./src/middleware/audit.middleware.js";
 import fs from 'fs';
 
 // 🔑 DYNAMIC SERVICE ACCOUNT INITIALIZATION
@@ -54,12 +56,13 @@ const app = new Hono();
 
 // 1. CORS first to handle preflight headers
 app.use('*', cors());
-
+ensureAuditLogIndexes();
 // 2. Health check (kept open for monitoring checks)
 app.get('/', (c) => c.json({ status: 'ok', message: 'ZHINI API Live' }));
 
 // 3. Prometheus Metrics Middleware (observes duration & counts requests)
 app.use("*", metricsMiddleware);
+app.use("*", auditHttpMiddleware);
 
 // 4. Mount Prometheus Scraping Endpoint (Before rate limiter & auth)
 app.route("/metrics", metricsRoute);
