@@ -28,11 +28,42 @@ const getCoordinatesFromLocation = async (address, pincode) => {
   return [80.1918, 12.9171];
 };
 
+// 📍 Resolve Pincode to Lat/Lng with Permanent MongoDB Caching
+export const getCoordinatesFromPincode = async (pincode, db) => {
+  if (!pincode || !/^\d{6}$/.test(pincode.trim())) return null;
+  const cleanPin = pincode.trim();
 
+  try {
+    const geoCache = db.collection('pincode_cache');
+    const cached = await geoCache.findOne({ pincode: cleanPin });
+    if (cached && cached.location?.lat && cached.location?.lng) {
+      return cached.location;
+    }
+
+    const url = `https://maps.googleapis.com/maps/api/geocode/json?address=${cleanPin}&components=country:IN&key=${GOOGLE_PLACES_API_KEY}`;
+    const res = await axios.get(url);
+
+    if (res.data.status === 'OK' && res.data.results.length > 0) {
+      const loc = res.data.results[0].geometry.location;
+      const coordinates = { lat: loc.lat, lng: loc.lng };
+
+      await geoCache.updateOne(
+        { pincode: cleanPin },
+        { $set: { pincode: cleanPin, location: coordinates, updatedAt: new Date() } },
+        { upsert: true }
+      );
+
+      return coordinates;
+    }
+  } catch (err) {
+    console.warn(`⚠️ Pincode geocode lookup failed for ${cleanPin}:`, err.message);
+  }
+
+  return null;
+};
 
 export const getNearbyService = async (c) => {
   try {
-    // 1. Read request body (for JSON payloads) with fallback to query params
     let body = {};
     try {
       body = await c.req.json();
@@ -44,19 +75,18 @@ export const getNearbyService = async (c) => {
     const rawProduct = body.product || c.req.query('product') || '';
     const rawPincode = body.pincode || c.req.query('pincode') || '';
 
-    // Direct coordinates passed from mobile
     const rawLat = body.latitude || body.lat || c.req.query('latitude') || c.req.query('lat') || null;
     const rawLng = body.longitude || body.lng || c.req.query('longitude') || c.req.query('lng') || null;
 
     const lat = rawLat !== null ? parseFloat(rawLat) : null;
     const lng = rawLng !== null ? parseFloat(rawLng) : null;
 
-    const isUnderWarranty = body.isUnderWarranty === true ||
+    const isUnderWarranty =
+      body.isUnderWarranty === true ||
       body.inWarranty === true ||
       c.req.query('isUnderWarranty') === 'true' ||
       c.req.query('inWarranty') === 'true';
 
-    // Helper to sanitize inputs
     const cleanValue = (val) => {
       if (!val) return '';
       const sanitized = String(val).trim();
@@ -72,7 +102,6 @@ export const getNearbyService = async (c) => {
     const hasCoordinates = lat !== null && !isNaN(lat) && lng !== null && !isNaN(lng);
     const hasLocation = pincode || hasCoordinates;
 
-    // Validation: Require location (pincode OR lat/lng) and at least one search term
     if (!hasLocation || (!brand && !product)) {
       console.warn(`⚠️ Validation Failed [400]: brand="${rawBrand}", product="${rawProduct}", pincode="${rawPincode}", lat="${rawLat}", lng="${rawLng}"`);
       return c.json({
@@ -81,17 +110,22 @@ export const getNearbyService = async (c) => {
       }, 400);
     }
 
-    // Determine location string for scraper & cache keys
-    const locationQuery = pincode || `${lat.toFixed(4)},${lng.toFixed(4)}`;
-
     const response = await withDatabase(mongoUri, async (db) => {
       const cacheCollection = db.collection('service_cache');
+
+      // Resolve effective coordinates (Mobile GPS or Geocoded Pincode)
+      let effectiveCoords = hasCoordinates ? { lat, lng } : null;
+      if (!effectiveCoords && pincode) {
+        effectiveCoords = await getCoordinatesFromPincode(pincode, db);
+      }
+
+      const locationQuery = pincode || (effectiveCoords ? `${effectiveCoords.lat.toFixed(4)},${effectiveCoords.lng.toFixed(4)}` : '');
 
       // -------------------------------------------------------------
       // TIER 1: ACTIVE WARRANTY -> Authorized Service Centers Only
       // -------------------------------------------------------------
       if (isUnderWarranty) {
-        console.log(`🛡️ Tier 1 Triggered: Searching Authorized Centers for ${brand} ${product} in ${locationQuery}`);
+        console.log(`🛡️ Tier 1 Triggered: Searching Authorized Centers for ${brand} ${product} near ${locationQuery}`);
         const cacheKey = `tier1_${brand}_${product}_${locationQuery}`.toLowerCase().replace(/[^a-z0-9]/g, '');
 
         const cached = await cacheCollection.findOne({ key: cacheKey });
@@ -100,7 +134,13 @@ export const getNearbyService = async (c) => {
           return { tier: 1, tierName: 'Brand Authorized', data: cached.data };
         }
 
-        const centers = await scrapeServiceCenters(brand, product, locationQuery, { authorizedOnly: true });
+        const centers = await scrapeServiceCenters(
+          brand,
+          product,
+          locationQuery,
+          effectiveCoords,
+          { authorizedOnly: true, maxDistanceKm: 75 }
+        );
 
         if (centers.length > 0) {
           await cacheCollection.updateOne(
@@ -114,7 +154,7 @@ export const getNearbyService = async (c) => {
       }
 
       // -------------------------------------------------------------
-      // TIER 2: OUT OF WARRANTY -> Local Zhini Service Providers (GeoJSON Radius + Expertise Match)
+      // TIER 2: OUT OF WARRANTY -> Local Zhini Service Providers
       // -------------------------------------------------------------
       console.log(`🔍 Checking Tier 2: Zhini Local Providers for "${product || brand}" near location="${locationQuery}"`);
 
@@ -124,37 +164,35 @@ export const getNearbyService = async (c) => {
         const searchTerm = product || brand;
         const searchRegex = new RegExp(searchTerm.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'), 'i');
 
-        // Query active providers matching expertise
         const activeProviders = await providerCollection.find({
           status: 'active',
-          expertise: { $elemMatch: { $regex: searchRegex } }
+          expertise: { $elemMatch: {$regex: searchRegex } }
         }).toArray();
 
         let matchingProviders = [];
 
-        if (hasCoordinates) {
-          // Precise distance calculation using mobile coordinates [lng, lat]
-          matchingProviders = activeProviders.filter((provider) => {
-            if (!provider.location || !provider.location.coordinates) return false;
+        if (effectiveCoords) {
+          // Precise radius filtering using coordinates
+          matchingProviders = activeProviders
+            .map((provider) => {
+              if (!provider.location || !provider.location.coordinates) return null;
 
-            const [pLng, pLat] = provider.location.coordinates;
+              const [pLng, pLat] = provider.location.coordinates;
+              const distanceKm = calculateDistanceKm(effectiveCoords.lat, effectiveCoords.lng, pLat, pLng);
+              const maxRadius = Number(provider.serviceRadiusKm) || 10;
 
-            // Haversine distance formula in km
-            const R = 6371;
-            const dLat = (pLat - lat) * (Math.PI / 180);
-            const dLon = (pLng - lng) * (Math.PI / 180);
-            const a =
-              Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-              Math.cos(lat * (Math.PI / 180)) * Math.cos(pLat * (Math.PI / 180)) *
-              Math.sin(dLon / 2) * Math.sin(dLon / 2);
-            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-            const distanceKm = R * c;
-
-            const maxRadius = Number(provider.serviceRadiusKm) || 10;
-            return distanceKm <= maxRadius;
-          });
+              if (distanceKm <= maxRadius) {
+                return {
+                  ...provider,
+                  distanceKm: parseFloat(distanceKm.toFixed(2)),
+                };
+              }
+              return null;
+            })
+            .filter(Boolean)
+            .sort((a, b) => a.distanceKm - b.distanceKm);
         } else {
-          // Direct pincode match fallback if no coordinates were provided
+          // Fallback exact pincode match if geocoding failed
           matchingProviders = activeProviders.filter(
             (provider) => provider.pincode === pincode
           );
@@ -171,6 +209,7 @@ export const getNearbyService = async (c) => {
             pincode: provider.pincode,
             shopImageUrl: provider.shopImageUrl || null,
             serviceRadiusKm: provider.serviceRadiusKm,
+            distanceKm: provider.distanceKm ?? null,
             gstNumber: provider.gstNumber || null,
             expertise: provider.expertise || []
           }));
@@ -186,9 +225,9 @@ export const getNearbyService = async (c) => {
       }
 
       // -------------------------------------------------------------
-      // TIER 3 (Fallback): OUT OF WARRANTY + NO IN-RANGE ZHINI PROVIDER -> Top 20 General
+      // TIER 3 (Fallback): OUT OF WARRANTY + NO LOCAL ZHINI PARTNER -> Top Nearby Centers
       // -------------------------------------------------------------
-      console.log(`🏢 Tier 3 Fallback Triggered: Fetching Top 20 local centers for ${brand || product} in ${locationQuery}`);
+      console.log(`🏢 Tier 3 Fallback Triggered: Fetching local centers for ${brand || product} in ${locationQuery}`);
       const cacheKeyTier3 = `tier3_${brand}_${product}_${locationQuery}`.toLowerCase().replace(/[^a-z0-9]/g, '');
 
       const cachedTier3 = await cacheCollection.findOne({ key: cacheKeyTier3 });
@@ -197,29 +236,44 @@ export const getNearbyService = async (c) => {
         return { tier: 3, tierName: 'General Top Rated', data: cachedTier3.data };
       }
 
-      const rawCenters = await scrapeServiceCenters(brand, product, locationQuery, { authorizedOnly: false });
+      const rawCenters = await scrapeServiceCenters(
+        brand,
+        product,
+        locationQuery,
+        effectiveCoords,
+        { authorizedOnly: false, maxDistanceKm: 75 }
+      );
 
-      // Sort by rating descending and store Top 20
-      const top20Centers = rawCenters
-        .sort((a, b) => (parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0))
-        .slice(0, 20);
+      let sortedCenters = rawCenters;
+      if (!effectiveCoords) {
+        sortedCenters = rawCenters.sort(
+          (a, b) => (parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0)
+        );
+      }
 
-      if (top20Centers.length > 0) {
+      const finalCenters = sortedCenters.slice(0, 20);
+
+      if (finalCenters.length > 0) {
         await cacheCollection.updateOne(
           { key: cacheKeyTier3 },
-          { $set: { key: cacheKeyTier3, data: top20Centers, timestamp: Date.now() } },
+          { $set: { key: cacheKeyTier3, data: finalCenters, timestamp: Date.now() } },
           { upsert: true }
         );
       }
 
-      return { tier: 3, tierName: 'General Top Rated', data: top20Centers };
+      return { tier: 3, tierName: 'General Top Rated', data: finalCenters };
     });
+
+    const hasResults = response.data && response.data.length > 0;
 
     return c.json({
       success: true,
       tier: response.tier,
       tierName: response.tierName,
       count: response.data.length,
+      message: hasResults
+        ? "Service centers retrieved successfully"
+        : "No authorized or repair service centers found within your area (75 km).",
       data: response.data
     }, 200);
 
