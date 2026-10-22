@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import axios from "axios";
 import { withDatabase } from '../utils/config.js';
 import{ sendPushNotification }  from '../utils/fcmHelper.js';
 import { scrapeServiceCenters, scrapeHomeServices } from '../services/scrapeService.js';
@@ -9,7 +10,7 @@ import { createServiceCard, moveCardToList, createProviderBoard,getWekanAuthHead
 const mongoUri = process.env.MONGODB_URI;
 // 1 Month / 30 Days (new)
 const CACHE_EXPIRATION_MS = 30 * 24 * 60 * 60 * 1000; //One month cache 
-
+const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY;
 
 const getCoordinatesFromLocation = async (address, pincode) => {
   try {
