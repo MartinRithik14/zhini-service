@@ -17,7 +17,6 @@ const calculateDistanceKm = (lat1, lon1, lat2, lon2) => {
 
 
 
-// 🏢 Scrape & Distance-Filter Google Places Service Centers
 export const scrapeServiceCenters = async (
   brand,
   product,
@@ -41,25 +40,29 @@ export const scrapeServiceCenters = async (
         : `${cleanProduct} repair service center`;
     }
 
-    // Do not append "near ..." when coordinates exist so locationBias takes precedence
-    const searchQuery = (coordinates && coordinates.lat && coordinates.lng)
-      ? queryTerm
-      : `${queryTerm} near ${locationQuery}`;
-
     const requestPayload = {
-      textQuery: searchQuery,
+      textQuery: (coordinates && coordinates.lat && coordinates.lng) 
+        ? queryTerm 
+        : `${queryTerm} near ${locationQuery}`,
     };
 
     if (coordinates && coordinates.lat !== null && coordinates.lng !== null) {
-      requestPayload.locationBias = {
-        circle: {
-          center: {
-            latitude: coordinates.lat,
-            longitude: coordinates.lng,
+      // Define a ~55 km bounding box rectangle for Google Places API (New)
+      const delta = 0.5; // ~55 km in each direction
+
+      requestPayload.locationRestriction = {
+        rectangle: {
+          low: {
+            latitude: coordinates.lat - delta,
+            longitude: coordinates.lng - delta,
           },
-          radius: 50000.0, // 50 km bias
+          high: {
+            latitude: coordinates.lat + delta,
+            longitude: coordinates.lng + delta,
+          },
         },
       };
+
       requestPayload.rankPreference = "DISTANCE";
     }
 
@@ -103,7 +106,7 @@ export const scrapeServiceCenters = async (
       };
     });
 
-    // 🛑 STRICT RADIUS FILTER: Drops anything outside maxDistanceKm
+    // Final gatekeeper: drop anything outside maxDistanceKm and sort nearest first
     if (coordinates && coordinates.lat !== null && coordinates.lng !== null) {
       const maxDistance = options.maxDistanceKm || 75;
 
