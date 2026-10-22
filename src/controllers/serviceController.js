@@ -63,14 +63,25 @@ export const getCoordinatesFromPincode = async (pincode, db) => {
   return null;
 };
 
+// Clean phone numbers to last 10 digits to prevent string format mismatches
+const normalizePhone = (phone) => {
+  if (!phone) return '';
+  const digits = String(phone).replace(/\D/g, '');
+  return digits.length >= 10 ? digits.slice(-10) : digits;
+};
+
 export const getNearbyService = async (c) => {
   try {
     let body = {};
     try {
       body = await c.req.json();
     } catch (_) {
-      // Body was empty or not JSON; fall back to query params
+      // Body was empty or not JSON; fallback to query params
     }
+
+    // 👤 Customer Phone from Auth Header
+    const customerPhoneHeader = c.req.header('x-user-phone') || '';
+    const cleanCustomerPhone = normalizePhone(customerPhoneHeader);
 
     const rawBrand = body.brand || c.req.query('brand') || '';
     const rawProduct = body.product || c.req.query('product') || '';
@@ -155,70 +166,136 @@ export const getNearbyService = async (c) => {
       }
 
       // -------------------------------------------------------------
-      // TIER 2: OUT OF WARRANTY -> Local Zhini Service Providers
+      // TIER 2: OUT OF WARRANTY -> Zhini Providers (Tags + Wekan Trust Ranking)
       // -------------------------------------------------------------
       console.log(`🔍 Checking Tier 2: Zhini Local Providers for "${product || brand}" near location="${locationQuery}"`);
 
       try {
         const providerCollection = db.collection('service-providers');
+        const wekanCollection = db.collection('wekan-service');
 
-        const searchTerm = product || brand;
-        const searchRegex = new RegExp(searchTerm.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'), 'i');
+        // Normalize requested product/brand into search slugs
+        const targetProductTag = normalizeTag(product);
+        const targetBrandTag = normalizeTag(brand);
 
-        const activeProviders = await providerCollection.find({
-          status: 'active',
-          expertise: { $elemMatch: {$regex: searchRegex } }
-        }).toArray();
+        // 1. Fetch active providers
+        const activeProviders = await providerCollection.find({ status: 'active' }).toArray();
 
-        let matchingProviders = [];
+        // 2. Filter providers by Expertise Tag match & Geographical Distance
+        const matchingProviders = activeProviders
+          .map((provider) => {
+            const providerTags = Array.isArray(provider.expertise)
+              ? provider.expertise.map(normalizeTag)
+              : [];
 
-        if (effectiveCoords) {
-          // Precise radius filtering using coordinates
-          matchingProviders = activeProviders
-            .map((provider) => {
-              if (!provider.location || !provider.location.coordinates) return null;
-
-              const [pLng, pLat] = provider.location.coordinates;
-              const distanceKm = calculateDistanceKm(effectiveCoords.lat, effectiveCoords.lng, pLat, pLng);
-              const maxRadius = Number(provider.serviceRadiusKm) || 10;
-
-              if (distanceKm <= maxRadius) {
-                return {
-                  ...provider,
-                  distanceKm: parseFloat(distanceKm.toFixed(2)),
-                };
+            // Tag match: tag slug includes query slug or vice-versa (e.g. "laptop" matches "laptop" or "laptop_repair")
+            const isMatch = providerTags.some((tag) => {
+              if (targetProductTag && (tag.includes(targetProductTag) || targetProductTag.includes(tag))) {
+                return true;
               }
+              if (targetBrandTag && (tag.includes(targetBrandTag) || targetBrandTag.includes(tag))) {
+                return true;
+              }
+              return false;
+            });
+
+            if (!isMatch) return null;
+
+            // Distance calculation & radius cutoff
+            let distanceKm = null;
+            if (effectiveCoords && provider.location?.coordinates) {
+              const [pLng, pLat] = provider.location.coordinates;
+              distanceKm = parseFloat(
+                calculateDistanceKm(effectiveCoords.lat, effectiveCoords.lng, pLat, pLng).toFixed(2)
+              );
+              const maxRadius = Number(provider.serviceRadiusKm) || 10;
+              if (distanceKm > maxRadius) return null; // Outside provider's operational zone
+            } else if (pincode && provider.pincode !== pincode) {
+              // Direct pincode fallback if geocoding coordinates are missing
               return null;
-            })
-            .filter(Boolean)
-            .sort((a, b) => a.distanceKm - b.distanceKm);
-        } else {
-          // Fallback exact pincode match if geocoding failed
-          matchingProviders = activeProviders.filter(
-            (provider) => provider.pincode === pincode
-          );
-        }
+            }
 
+            return {
+              ...provider,
+              distanceKm,
+            };
+          })
+          .filter(Boolean);
+
+        // 3. If matching providers exist, apply Wekan Social Proof & History Ranking
         if (matchingProviders.length > 0) {
-          console.log(`🎯 Tier 2 Hit: Found ${matchingProviders.length} Zhini Service Provider(s) in range`);
+          // A. User Past Service History
+          let userPastMobiles = new Set();
+          if (cleanCustomerPhone) {
+            const customerTickets = await wekanCollection.find({
+              'customerDetails.phone': { $regex: cleanCustomerPhone }
+            }).toArray();
 
-          const providerList = matchingProviders.map((provider) => ({
-            id: provider._id,
-            name: provider.name,
-            mobile: provider.mobile,
-            address: provider.address,
-            pincode: provider.pincode,
-            shopImageUrl: provider.shopImageUrl || null,
-            serviceRadiusKm: provider.serviceRadiusKm,
-            distanceKm: provider.distanceKm ?? null,
-            gstNumber: provider.gstNumber || null,
-            expertise: provider.expertise || []
-          }));
+            customerTickets.forEach((t) => {
+              if (t.assignedTo) {
+                userPastMobiles.add(normalizePhone(t.assignedTo));
+              }
+            });
+          }
+
+          // B. Neighbor Service History (Tickets in the customer's pincode area)
+          let neighborCountMap = {};
+          if (pincode) {
+            // Match pincode inside customerDetails.address
+            const neighborTickets = await wekanCollection.find({
+              'customerDetails.address': { $regex: pincode }
+            }).toArray();
+
+            neighborTickets.forEach((t) => {
+              if (t.assignedTo) {
+                const pPhone = normalizePhone(t.assignedTo);
+                neighborCountMap[pPhone] = (neighborCountMap[pPhone] || 0) + 1;
+              }
+            });
+          }
+
+          // C. Map & Enrich Providers with trust scores
+          const rankedProviders = matchingProviders.map((provider) => {
+            const pPhone = normalizePhone(provider.mobile);
+            const hasUsedBefore = userPastMobiles.has(pPhone);
+            const neighborServiceCount = neighborCountMap[pPhone] || 0;
+
+            return {
+              id: provider._id,
+              name: provider.name,
+              mobile: provider.mobile,
+              address: provider.address,
+              pincode: provider.pincode,
+              shopImageUrl: provider.shopImageUrl || null,
+              serviceRadiusKm: provider.serviceRadiusKm,
+              distanceKm: provider.distanceKm ?? null,
+              gstNumber: provider.gstNumber || null,
+              expertise: provider.expertise || [],
+              hasUsedBefore,
+              neighborServiceCount,
+            };
+          });
+
+          // D. Multi-Factor Sort: Past Provider > Neighbor Trust > Distance (Ascending)
+          rankedProviders.sort((a, b) => {
+            // 1. Personal past relationship comes first
+            if (a.hasUsedBefore !== b.hasUsedBefore) {
+              return b.hasUsedBefore ? 1 : -1;
+            }
+            // 2. Neighbor service volume (social proof)
+            if (b.neighborServiceCount !== a.neighborServiceCount) {
+              return b.neighborServiceCount - a.neighborServiceCount;
+            }
+            // 3. Proximity
+            return (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity);
+          });
+
+          console.log(`🎯 Tier 2 Hit: Found ${rankedProviders.length} Zhini Service Provider(s) ranked by history & proximity`);
 
           return {
             tier: 2,
             tierName: 'Zhini Verified Partner',
-            data: providerList
+            data: rankedProviders
           };
         }
       } catch (err) {
@@ -226,7 +303,7 @@ export const getNearbyService = async (c) => {
       }
 
       // -------------------------------------------------------------
-      // TIER 3 (Fallback): OUT OF WARRANTY + NO LOCAL ZHINI PARTNER -> Top Nearby Centers
+      // TIER 3 (Fallback): OUT OF WARRANTY + NO LOCAL ZHINI PARTNER -> Google Places
       // -------------------------------------------------------------
       console.log(`🏢 Tier 3 Fallback Triggered: Fetching local centers for ${brand || product} in ${locationQuery}`);
       const cacheKeyTier3 = `tier3_${brand}_${product}_${locationQuery}`.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -273,14 +350,14 @@ export const getNearbyService = async (c) => {
       tierName: response.tierName,
       count: response.data.length,
       message: hasResults
-        ? "Service centers retrieved successfully"
-        : "No authorized or repair service centers found within your area (75 km).",
+        ? 'Service centers retrieved successfully'
+        : 'No authorized or repair service centers found within your area (75 km).',
       data: response.data
     }, 200);
 
   } catch (error) {
-    console.error("❌ Service Controller Error:", error);
-    return c.json({ success: false, message: "Internal Server Error", error: error.message }, 500);
+    console.error('❌ Service Controller Error:', error);
+    return c.json({ success: false, message: 'Internal Server Error', error: error.message }, 500);
   }
 };
 
@@ -412,43 +489,61 @@ export const getServiceProviderByMobile = async (c) => {
   }
 };
 
+// Helper to normalize any tag string into a clean lowercase slug
+export const normalizeTag = (tag) => {
+  return String(tag || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_') // Replace spaces, hyphens, symbols with underscores
+    .replace(/^_+|_+$/g, '');   // Trim leading/trailing underscores
+};
+
 export const createServiceProvider = async (c) => {
   try {
     const body = await c.req.parseBody();
 
-    const name = body["name"];
-    const mobile = body["mobile"];
-    const range = body["range"];
-    const expertiseInput = body["expertise"];
-    const gstNumber = body["gstNumber"] || null;
-    const address = body["address"];
-    const pincode = body["pincode"] || null;
+    const name = body['name'];
+    const mobile = body['mobile'];
+    const range = body['range'];
+    const expertiseInput = body['expertise'];
+    const gstNumber = body['gstNumber'] || null;
+    const address = body['address'];
+    const pincode = body['pincode'] || null;
 
     if (!name || !mobile || !range || !expertiseInput || !address) {
       return c.json({
         success: false,
-        message: "Missing required fields: name, mobile, range, or expertise."
+        message: 'Missing required fields: name, mobile, range, or expertise.'
       }, 400);
     }
 
     const cleanMobile = mobile.trim();
 
-    let expertise = [];
-    if (typeof expertiseInput === "string") {
-      expertise = expertiseInput.split(",").map((e) => e.trim()).filter(Boolean);
+    // 🏷️ Tag Normalization: sanitize tags to lowercase slugs (e.g., ["ac_repair", "laptop", "plumbing"])
+    let rawTags = [];
+    if (typeof expertiseInput === 'string') {
+      rawTags = expertiseInput.split(',').map((e) => e.trim());
     } else if (Array.isArray(expertiseInput)) {
-      expertise = expertiseInput.map((e) => String(e).trim());
+      rawTags = expertiseInput.map((e) => String(e).trim());
+    }
+
+    const expertise = [...new Set(rawTags.map(normalizeTag).filter(Boolean))];
+
+    if (expertise.length === 0) {
+      return c.json({
+        success: false,
+        message: 'At least one valid expertise tag is required (e.g. laptop, ac_repair).'
+      }, 400);
     }
 
     // Resolve GeoJSON Coordinates [longitude, latitude]
     const coordinates = await getCoordinatesFromLocation(address, pincode);
 
-    // Upload shop photo directly to Cloudflare R2
+    // Upload shop photo directly to Cloudflare R2 if provided
     let shopImageUrl = null;
-    const photoFile = body["photo"];
-
+    const photoFile = body['photo'];
     if (photoFile && photoFile instanceof File) {
-      shopImageUrl = await uploadToR2(photoFile, "shop-images");
+      shopImageUrl = await uploadToR2(photoFile, 'shop-images');
     }
 
     // Provision Wekan Board
@@ -458,15 +553,15 @@ export const createServiceProvider = async (c) => {
     const newProvider = {
       name: name.trim(),
       mobile: cleanMobile,
-      expertise,
-      serviceRadiusKm: Number(range) || range,
+      expertise, // Standardized slugs array
+      serviceRadiusKm: Number(range) || 10,
       gstNumber: gstNumber ? gstNumber.trim() : null,
-      shopImageUrl, // Stores HTTPS R2 URL
-      status: "active",
+      shopImageUrl,
+      status: 'active',
       address: address.trim(),
       pincode: pincode ? pincode.trim() : null,
       location: {
-        type: "Point",
+        type: 'Point',
         coordinates: coordinates // [longitude, latitude]
       },
       wekanBoardId: boardResult.boardId,
@@ -476,17 +571,14 @@ export const createServiceProvider = async (c) => {
     };
 
     const result = await withDatabase(mongoUri, async (db) => {
-      const collection = db.collection("service-providers");
-
-      // Ensure 2dsphere index exists for spatial queries
-      await collection.createIndex({ location: "2dsphere" });
-
+      const collection = db.collection('service-providers');
+      await collection.createIndex({ location: '2dsphere' });
       return await collection.insertOne(newProvider);
     });
 
     return c.json({
       success: true,
-      message: "Service Provider created successfully with Wekan board, R2 image storage, and GeoJSON location.",
+      message: 'Service Provider created successfully with standardized tags, Wekan board, and GeoJSON location.',
       data: {
         _id: result.insertedId,
         ...newProvider
@@ -494,10 +586,10 @@ export const createServiceProvider = async (c) => {
     }, 201);
 
   } catch (error) {
-    console.error("❌ Create Service Provider Controller Error:", error);
+    console.error('❌ Create Service Provider Controller Error:', error);
     return c.json({
       success: false,
-      message: "Internal Server Error",
+      message: 'Internal Server Error',
       error: error.message
     }, 500);
   }
