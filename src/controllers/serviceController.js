@@ -1,11 +1,11 @@
 import 'dotenv/config';
 import axios from "axios";
 import { withDatabase } from '../utils/config.js';
-import{ sendPushNotification }  from '../utils/fcmHelper.js';
+import {  notifyUserByMobile } from '../utils/fcmHelper.js';
 import { scrapeServiceCenters, scrapeHomeServices } from '../services/scrapeService.js';
 import { ObjectId } from "mongodb";
 import { uploadToR2 } from "../services/r2.service.js";
-import { createServiceCard, moveCardToList, createProviderBoard,getWekanAuthHeaders } from '../services/wekan.js';
+import { createServiceCard, moveCardToList, createProviderBoard, getWekanAuthHeaders } from '../services/wekan.js';
 
 const mongoUri = process.env.MONGODB_URI;
 // 1 Month / 30 Days (new)
@@ -366,10 +366,10 @@ export const getNearbyHomeServices = async (c) => {
   try {
     // Read directly from body (with fallback for raw json or query)
     let body = {};
-    try { 
-      body = await c.req.json(); 
-    } catch (_) { 
-      body = await c.req.parseBody(); 
+    try {
+      body = await c.req.json();
+    } catch (_) {
+      body = await c.req.parseBody();
     }
 
     const serviceType = (body.serviceType || body.category || c.req.query('serviceType') || '').trim();
@@ -595,149 +595,7 @@ export const createServiceProvider = async (c) => {
   }
 };
 
-export const createServiceTicket = async (c) => {
-  try {
-    let body = {};
 
-    try {
-      body = await c.req.json();
-    } catch (_) {
-      body = await c.req.parseBody();
-    }
-
-    const customerName = body.customerName || body.customer_name;
-    const custNumber = body.cust_number || body.customerPhone || body.mobile;
-    const address = body.address;
-    const description = body.description || body.notes || "Service Request";
-    const providerMobile = body.providerMobile;
-
-    const rawAvailableTime = body.availableTime || body.preferredTime || body.timeSlot;
-    const availableTime = rawAvailableTime ? String(rawAvailableTime).trim() : "Flexible / Not specified";
-
-    if (!customerName || !custNumber || !address || !providerMobile) {
-      return c.json({
-        success: false,
-        message: "Missing required fields: customerName, cust_number, address, and providerMobile are required.",
-      }, 400);
-    }
-
-    const cleanProviderMobile = providerMobile.toString().trim();
-    let targetFcmTokens = [];
-
-    const ticketResult = await withDatabase(mongoUri, async (db) => {
-      const usersCollection = db.collection("users");
-      const providerCollection = db.collection("service-providers");
-      const wekanServiceCollection = db.collection("wekan-services");
-
-      // 1. Fetch provider user record from 'users' to extract FCM tokens
-      const providerUser = await usersCollection.findOne({
-        $or: [
-          { mobile: cleanProviderMobile },
-          { "UserInfo.phoneNo": cleanProviderMobile }
-        ]
-      });
-
-      if (providerUser?.PlatformInfo?.devices && Array.isArray(providerUser.PlatformInfo.devices)) {
-        // Collect all active fcmTokens (or prioritize isLastLoggedIn)
-        targetFcmTokens = providerUser.PlatformInfo.devices
-          .map((d) => d.fcmToken)
-          .filter(Boolean);
-      }
-
-      // 2. Fetch Provider record to get board context
-      let provider = await providerCollection.findOne({ mobile: cleanProviderMobile });
-
-      let boardId = provider?.wekanBoardId;
-      let newListId = provider?.wekanLists?.["New"];
-
-      // 3. Fallback: If board or list mapping is missing, provision new board and sync back
-      if (!boardId || !newListId) {
-        console.warn(`⚠️ Board info missing for provider '${cleanProviderMobile}'. Provisioning now...`);
-        const boardResult = await createProviderBoard(cleanProviderMobile);
-        boardId = boardResult.boardId;
-        newListId = boardResult.lists["New"];
-
-        if (provider) {
-          await providerCollection.updateOne(
-            { mobile: cleanProviderMobile },
-            {
-              $set: {
-                wekanBoardId: boardId,
-                wekanLists: boardResult.lists,
-                updatedAt: new Date()
-              }
-            }
-          );
-        }
-      }
-
-      // 4. Format details and create card in Wekan
-      const cardTitle = `Ticket: ${customerName.trim()} (${custNumber.trim()})`;
-      const cardDescription = `Customer Name: ${customerName.trim()}\nCustomer Phone: ${custNumber.trim()}\nAddress: ${address.trim()}\nAvailable Time: ${availableTime}\nDescription: ${description.trim()}`;
-
-      const cardId = await createServiceCard(boardId, newListId, {
-        title: cardTitle,
-        description: cardDescription,
-        customerPhone: custNumber.trim(),
-      });
-
-      // 5. Save ticket document in 'wekan-services' collection
-      const ticketRecord = {
-        ticketId: `TICK-${Date.now()}`,
-        assignedTo: cleanProviderMobile,
-        customerDetails: {
-          name: customerName.trim(),
-          phone: custNumber.trim(),
-          address: address.trim(),
-        },
-        serviceDetails: {
-          description: description.trim(),
-          availableTime: availableTime,
-        },
-        wekan: {
-          boardId: boardId,
-          cardId: cardId,
-          listId: newListId,
-        },
-        status: "NEW",
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-
-      await wekanServiceCollection.insertOne(ticketRecord);
-      return ticketRecord;
-    });
-
-    // 6. Non-blocking push notification dispatch
-    if (targetFcmTokens.length > 0) {
-      sendPushNotification(targetFcmTokens, {
-        title: "New Service Request! 🛠️",
-        body: `${customerName.trim()} requested a service at ${address.trim()}.`,
-        data: {
-          type: "SERVICE_TICKET",
-          ticketId: ticketResult.ticketId,
-          customerName: customerName.trim(),
-          customerPhone: custNumber.trim(),
-        },
-      }).catch((err) => console.error("⚠️ Background FCM Dispatch failed:", err));
-    }
-
-    return c.json({
-      success: true,
-      message: "Ticket created and assigned to service provider.",
-      data: ticketResult,
-    }, 201);
-
-  } catch (error) {
-    console.error("❌ Create Service Ticket Controller Error:", error);
-
-    return c.json({
-      success: false,
-      message: "Failed to create service ticket",
-      error: error.message,
-    }, 500);
-  }
-};
 
 
 export const getProviderTickets = async (c) => {
@@ -791,95 +649,7 @@ const STATUS_TO_WEKAN_LIST = {
   "COMPLETED": "Completed"
 };
 
-export const updateTicketStatus = async (c) => {
-  try {
-    let body = {};
-    try {
-      body = await c.req.json();
-    } catch (_) {
-      body = await c.req.parseBody();
-    }
 
-    const { ticketId, newStatus } = body;
-
-    if (!ticketId || !newStatus) {
-      return c.json({
-        success: false,
-        message: "Missing required fields: ticketId and newStatus are required."
-      }, 400);
-    }
-
-    const normalizedStatus = String(newStatus).trim().toUpperCase();
-    const targetListName = STATUS_TO_WEKAN_LIST[normalizedStatus];
-
-    if (!targetListName) {
-      return c.json({
-        success: false,
-        message: `Invalid status '${newStatus}'. Allowed statuses: ${Object.keys(STATUS_TO_WEKAN_LIST).join(", ")}`
-      }, 400);
-    }
-
-    const updatedTicket = await withDatabase(mongoUri, async (db) => {
-      const wekanServiceCollection = db.collection("wekan-services");
-      const providerCollection = db.collection("service-providers");
-
-      // 1. Fetch current ticket document from MongoDB
-      const ticket = await wekanServiceCollection.findOne({ ticketId: ticketId.trim() });
-      if (!ticket) {
-        throw new Error(`Ticket '${ticketId}' not found in database.`);
-      }
-
-      const { boardId, cardId, listId: currentListId } = ticket.wekan;
-      const assignedProviderMobile = ticket.assignedTo;
-
-      // 2. Fetch Provider details to resolve list ID mapping
-      let provider = await providerCollection.findOne({ mobile: assignedProviderMobile });
-      let newListId = provider?.wekanLists?.[targetListName];
-
-      // Fallback: If list mapping is missing on provider doc, fetch board structure directly from Wekan
-      if (!newListId) {
-        const boardResult = await createProviderBoard(assignedProviderMobile);
-        newListId = boardResult.lists[targetListName];
-      }
-
-      if (!newListId) {
-        throw new Error(`Target list '${targetListName}' could not be resolved on Wekan Board ${boardId}`);
-      }
-
-      // 3. Move card to the new list in Wekan
-      await moveCardToList(boardId, currentListId, cardId, newListId);
-
-      // 4. Update status and list context in MongoDB
-      const updateResult = await wekanServiceCollection.findOneAndUpdate(
-        { ticketId: ticketId.trim() },
-        {
-          $set: {
-            status: normalizedStatus,
-            "wekan.listId": newListId,
-            updatedAt: new Date()
-          }
-        },
-        { returnDocument: "after" }
-      );
-
-      return updateResult;
-    });
-
-    return c.json({
-      success: true,
-      message: `Ticket ${ticketId} updated to '${normalizedStatus}' successfully.`,
-      data: updatedTicket
-    }, 200);
-
-  } catch (error) {
-    console.error("❌ Update Ticket Status Controller Error:", error);
-    return c.json({
-      success: false,
-      message: "Failed to update ticket status",
-      error: error.message
-    }, 500);
-  }
-};
 
 export const cancelTicket = async (c) => {
   try {
@@ -1178,6 +948,7 @@ export const getHomeServiceHistory = async (c) => {
   }
 };
 
+
 export const submitTicketRating = async (c) => {
   try {
     let body = {};
@@ -1288,3 +1059,275 @@ export const submitTicketRating = async (c) => {
   }
 };
 
+
+const STATUS_NOTIFICATION_MAP = {
+  ACCEPTED: {
+    title: "Service Request Accepted! 🤝",
+    body: (shop) => `${shop || "The service partner"} has accepted your repair booking.`,
+  },
+  ON_THE_WAY: {
+    title: "Technician On The Way 🛵",
+    body: (shop) => `${shop || "The technician"} is heading to your address.`,
+  },
+  PICKED_UP: {
+    title: "Device Picked Up 📦",
+    body: () => "Your appliance was collected and is headed to the workshop.",
+  },
+  IN_PROGRESS: {
+    title: "Repair In Progress 🔧",
+    body: () => "Diagnosis complete. Repair work has begun on your appliance.",
+  },
+  ON_HOLD_PARTS: {
+    title: "Repair Temporarily On Hold ⏳",
+    body: () => "Work is paused while waiting for required spare parts to arrive.",
+  },
+  READY_FOR_DELIVERY: {
+    title: "Repair Complete! ✨",
+    body: () => "Your appliance has been serviced and is scheduled for return delivery.",
+  },
+  COMPLETED: {
+    title: "Service Completed ✅",
+    body: () => "Your device has been delivered. Thank you for choosing Zhini!",
+  },
+  CANCELLED: {
+    title: "Service Cancelled ❌",
+    body: () => "Your service ticket has been cancelled.",
+  },
+};
+
+export const createServiceTicket = async (c) => {
+  try {
+    let body = {};
+
+    try {
+      body = await c.req.json();
+    } catch (_) {
+      body = await c.req.parseBody();
+    }
+
+    const customerName = body.customerName || body.customer_name;
+    const custNumber = body.cust_number || body.customerPhone || body.mobile;
+    const address = body.address;
+    const description = body.description || body.notes || "Service Request";
+    const providerMobile = body.providerMobile;
+
+    const rawAvailableTime = body.availableTime || body.preferredTime || body.timeSlot;
+    const availableTime = rawAvailableTime ? String(rawAvailableTime).trim() : "Flexible / Not specified";
+
+    if (!customerName || !custNumber || !address || !providerMobile) {
+      return c.json({
+        success: false,
+        message: "Missing required fields: customerName, cust_number, address, and providerMobile are required.",
+      }, 400);
+    }
+
+    const cleanProviderMobile = providerMobile.toString().trim();
+    const cleanCustomerMobile = custNumber.toString().trim();
+
+    const ticketResult = await withDatabase(mongoUri, async (db) => {
+      const providerCollection = db.collection("service-providers");
+      const wekanServiceCollection = db.collection("wekan-services");
+
+      // 1. Fetch Provider record to get board context
+      let provider = await providerCollection.findOne({ mobile: cleanProviderMobile });
+
+      let boardId = provider?.wekanBoardId;
+      let newListId = provider?.wekanLists?.["New"];
+
+      // 2. Fallback: If board or list mapping is missing, provision new board and sync back
+      if (!boardId || !newListId) {
+        console.warn(`⚠️ Board info missing for provider '${cleanProviderMobile}'. Provisioning now...`);
+        const boardResult = await createProviderBoard(cleanProviderMobile);
+        boardId = boardResult.boardId;
+        newListId = boardResult.lists["New"];
+
+        if (provider) {
+          await providerCollection.updateOne(
+            { mobile: cleanProviderMobile },
+            {
+              $set: {
+                wekanBoardId: boardId,
+                wekanLists: boardResult.lists,
+                updatedAt: new Date()
+              }
+            }
+          );
+        }
+      }
+
+      // 3. Format details and create card in Wekan
+      const cardTitle = `Ticket: ${customerName.trim()} (${cleanCustomerMobile})`;
+      const cardDescription = `Customer Name: ${customerName.trim()}\nCustomer Phone: ${cleanCustomerMobile}\nAddress: ${address.trim()}\nAvailable Time: ${availableTime}\nDescription: ${description.trim()}`;
+
+      const cardId = await createServiceCard(boardId, newListId, {
+        title: cardTitle,
+        description: cardDescription,
+        customerPhone: cleanCustomerMobile,
+      });
+
+      // 4. Save ticket document in 'wekan-services' collection
+      const ticketRecord = {
+        ticketId: `TICK-${Date.now()}`,
+        assignedTo: cleanProviderMobile,
+        customerDetails: {
+          name: customerName.trim(),
+          phone: cleanCustomerMobile,
+          address: address.trim(),
+        },
+        serviceDetails: {
+          description: description.trim(),
+          availableTime: availableTime,
+        },
+        wekan: {
+          boardId: boardId,
+          cardId: cardId,
+          listId: newListId,
+        },
+        status: "NEW",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      await wekanServiceCollection.insertOne(ticketRecord);
+      return ticketRecord;
+    });
+
+    // 5. Non-blocking push notification dispatch to Provider via notifyUserByMobile
+    notifyUserByMobile(cleanProviderMobile, {
+      title: "New Service Request! 🛠️",
+      body: `${customerName.trim()} requested a service at ${address.trim()}.`,
+      data: {
+        type: "SERVICE_TICKET",
+        ticketId: ticketResult.ticketId,
+        customerName: customerName.trim(),
+        customerPhone: cleanCustomerMobile,
+      },
+    }).catch((err) => console.error("⚠️ Background FCM Dispatch failed:", err));
+
+    return c.json({
+      success: true,
+      message: "Ticket created and assigned to service provider.",
+      data: ticketResult,
+    }, 201);
+
+  } catch (error) {
+    console.error("❌ Create Service Ticket Controller Error:", error);
+
+    return c.json({
+      success: false,
+      message: "Failed to create service ticket",
+      error: error.message,
+    }, 500);
+  }
+};
+
+export const updateTicketStatus = async (c) => {
+  try {
+    let body = {};
+    try {
+      body = await c.req.json();
+    } catch (_) {
+      body = await c.req.parseBody();
+    }
+
+    const { ticketId, newStatus } = body;
+
+    if (!ticketId || !newStatus) {
+      return c.json({
+        success: false,
+        message: "Missing required fields: ticketId and newStatus are required."
+      }, 400);
+    }
+
+    const normalizedStatus = String(newStatus).trim().toUpperCase();
+    const targetListName = STATUS_TO_WEKAN_LIST[normalizedStatus];
+
+    if (!targetListName) {
+      return c.json({
+        success: false,
+        message: `Invalid status '${newStatus}'. Allowed statuses: ${Object.keys(STATUS_TO_WEKAN_LIST).join(", ")}`
+      }, 400);
+    }
+
+    let customerMobile = null;
+    let providerShopName = "";
+
+    const updatedTicket = await withDatabase(mongoUri, async (db) => {
+      const wekanServiceCollection = db.collection("wekan-services");
+      const providerCollection = db.collection("service-providers");
+
+      // 1. Fetch current ticket document from MongoDB
+      const ticket = await wekanServiceCollection.findOne({ ticketId: ticketId.trim() });
+      if (!ticket) {
+        throw new Error(`Ticket '${ticketId}' not found in database.`);
+      }
+
+      // Extract customer mobile for push notification
+      customerMobile = ticket.customerDetails?.phone;
+
+      const { boardId, cardId, listId: currentListId } = ticket.wekan;
+      const assignedProviderMobile = ticket.assignedTo;
+
+      // 2. Fetch Provider details to resolve list ID mapping and shop name
+      let provider = await providerCollection.findOne({ mobile: assignedProviderMobile });
+      providerShopName = provider?.shopName || provider?.name || "";
+      let newListId = provider?.wekanLists?.[targetListName];
+
+      // Fallback: If list mapping is missing on provider doc, fetch board structure directly from Wekan
+      if (!newListId) {
+        const boardResult = await createProviderBoard(assignedProviderMobile);
+        newListId = boardResult.lists[targetListName];
+      }
+
+      if (!newListId) {
+        throw new Error(`Target list '${targetListName}' could not be resolved on Wekan Board ${boardId}`);
+      }
+
+      // 3. Move card to the new list in Wekan
+      await moveCardToList(boardId, currentListId, cardId, newListId);
+
+      // 4. Update status and list context in MongoDB
+      const updateResult = await wekanServiceCollection.findOneAndUpdate(
+        { ticketId: ticketId.trim() },
+        {
+          $set: {
+            status: normalizedStatus,
+            "wekan.listId": newListId,
+            updatedAt: new Date()
+          }
+        },
+        { returnDocument: "after" }
+      );
+
+      return updateResult;
+    });
+
+    // 5. Non-blocking push notification dispatch to Customer
+    const statusMeta = STATUS_NOTIFICATION_MAP[normalizedStatus];
+    if (statusMeta && customerMobile) {
+      notifyUserByMobile(customerMobile, {
+        title: statusMeta.title,
+        body: statusMeta.body(providerShopName),
+        data: {
+          type: "TICKET_STATUS_UPDATE",
+          ticketId: ticketId.trim(),
+          status: normalizedStatus,
+        },
+      }).catch((err) => console.error("⚠️ Customer FCM Dispatch Error:", err));
+    }
+
+    return c.json({
+      success: true,
+      message: `Ticket ${ticketId} updated to '${normalizedStatus}' successfully.`,
+      data: updatedTicket
+    }, 200);
+
+  } catch (error) {
+    console.error("❌ Update Ticket Status Controller Error:", error);
+    return c.json({
+      success: false,
+      message: "Failed to update ticket status",
+      error: error.message
+    }, 500);
+  }
+};

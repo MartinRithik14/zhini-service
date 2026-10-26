@@ -1,43 +1,10 @@
-import admin from "firebase-admin";
-import { getMessaging } from "firebase-admin/messaging";
-import { withDatabase } from '../utils/config.js';// Adjust import to your db wrapper
-
-
+import { withDatabase } from "../utils/config.js";
+import { sendPushNotification, notifyUserByMobile } from "../utils/fcmHelper.js";
 
 const MONGODB_URI = process.env.MONGODB_URI;
-// Simpler countdown milestones (days remaining until warranty expiry)
+
+// Countdown milestones (days remaining until warranty expiry)
 const WARRANTY_MILESTONES = [30, 15, 7, 3, 1, 0];
-
-/**
- * 📲 Core Push Notification Sender using Firebase Admin Multicast
- */
-export const sendPushNotification = async (fcmTokens, title, body, dataPayload = {}) => {
-  if (!fcmTokens || fcmTokens.length === 0) return null;
-
-  const validTokens = [...new Set(fcmTokens.filter(Boolean))];
-  if (validTokens.length === 0) return null;
-
-  try {
-    const message = {
-      tokens: validTokens,
-      notification: {
-        title,
-        body,
-      },
-      data: Object.fromEntries(
-        Object.entries(dataPayload).map(([k, v]) => [k, String(v)])
-      ),
-    };
-
-    // 🚀 Use getMessaging() directly
-    const response = await getMessaging().sendEachForMulticast(message);
-    console.log(`📲 FCM Sent: ${response.successCount} succeeded, ${response.failureCount} failed.`);
-    return response;
-  } catch (err) {
-    console.error("❌ FCM Multicast Error:", err.message);
-    return null;
-  }
-};
 
 /**
  * 🛠️ Daily Warranty Expiry Processor
@@ -96,7 +63,7 @@ export const processDailyWarrantyExpiryJob = async (db, job) => {
       const user = await usersCollection.findOne({
         $or: [
           { mobile: userMobile },
-          { "PlatformInfo.devices.authToken": { $exists: true } },
+          { "UserInfo.phoneNo": userMobile },
           { _id: device.addedByUserId }
         ]
       });
@@ -128,7 +95,7 @@ export const processDailyWarrantyExpiryJob = async (db, job) => {
         body = `Warranty for your ${productName} has expired today. Switch to Zhini Verified local service partners.`;
       }
 
-      // 4. Dispatch FCM Push
+      // 4. Dispatch FCM Push via shared helper
       await sendPushNotification(fcmTokens, title, body, {
         type: "WARRANTY_EXPIRY",
         deviceId: device.deviceId || String(device._id),
@@ -240,55 +207,27 @@ export const startQueueRunner = () => {
   }, 30000); // Polls every 30 seconds
 };
 
-
 /**
- * 🧪 Test Runner: Directly fires a push notification to a specific mobile number
+ * 🧪 Test Runner: Directly fires a push notification to a specific mobile number using notifyUserByMobile
  */
 export const testDirectNotification = async (targetMobile = "9342639912") => {
   console.log(`\n🧪 [TEST NOTIFICATION] Starting test for mobile: ${targetMobile}...`);
 
   try {
-    await withDatabase(MONGODB_URI, async (db) => {
-      const usersCollection = db.collection("users");
-
-      // Find user document by mobile
-      const user = await usersCollection.findOne({ mobile: targetMobile });
-
-      if (!user) {
-        console.error(`❌ [TEST NOTIFICATION] No user found with mobile: ${targetMobile}`);
-        return;
-      }
-
-      // Extract FCM tokens from PlatformInfo.devices array
-      const userDevices = user?.PlatformInfo?.devices || [];
-      const fcmTokens = userDevices
-        .map((d) => d.fcmToken)
-        .filter(Boolean);
-
-      console.log(`📱 Found ${fcmTokens.length} active device token(s) for user: ${targetMobile}`);
-
-      if (fcmTokens.length === 0) {
-        console.warn(`⚠️ [TEST NOTIFICATION] No FCM tokens present in PlatformInfo.devices for this user.`);
-        return;
-      }
-
-      // Send test message
-      const response = await sendPushNotification(
-        fcmTokens,
-        "Zhini Test Alert 🔔",
-        "Your FCM notification pipeline is active and working!",
-        {
-          type: "TEST_ALERT",
-          timestamp: new Date().toISOString()
-        }
-      );
-
-      if (response && response.successCount > 0) {
-        console.log(`🎉 [TEST NOTIFICATION] Successfully delivered test notification to your device!\n`);
-      } else {
-        console.error(`❌ [TEST NOTIFICATION] Message dispatch failed. Details:`, response?.responses);
+    const response = await notifyUserByMobile(targetMobile, {
+      title: "Zhini Test Alert 🔔",
+      body: "Your FCM notification pipeline is active and working!",
+      data: {
+        type: "TEST_ALERT",
+        timestamp: new Date().toISOString()
       }
     });
+
+    if (response && response.successCount > 0) {
+      console.log(`🎉 [TEST NOTIFICATION] Successfully delivered test notification to mobile: ${targetMobile}\n`);
+    } else {
+      console.error(`❌ [TEST NOTIFICATION] Message dispatch failed or no tokens found.`);
+    }
   } catch (error) {
     console.error("❌ [TEST NOTIFICATION] Error executing test function:", error.message);
   }

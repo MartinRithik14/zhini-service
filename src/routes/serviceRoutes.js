@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { getNearbyService,getHomeServiceHistory,submitTicketRating,cancelTicket,getNearbyHomeServices,createServiceProvider,addTicketBilling,createServiceTicket,getProviderTickets,updateTicketStatus,getServiceProviderByMobile } from '../controllers/serviceController.js';
+import { getNearbyService,updateServiceProvider,getHomeServiceHistory,submitTicketRating,cancelTicket,getNearbyHomeServices,createServiceProvider,addTicketBilling,createServiceTicket,getProviderTickets,updateTicketStatus,getServiceProviderByMobile } from '../controllers/serviceController.js';
 
 const serviceRouter = new Hono();
 
@@ -10,6 +10,7 @@ serviceRouter.post('/home-services', getNearbyHomeServices);
 
 
 serviceRouter.post('/create-provider', createServiceProvider);
+serviceRouter.put("/update-provider", updateServiceProvider);
 
 serviceRouter.get('/provider', getServiceProviderByMobile);
 
