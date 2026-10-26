@@ -595,6 +595,132 @@ export const createServiceProvider = async (c) => {
   }
 };
 
+export const updateServiceProvider = async (c) => {
+  try {
+    let body = {};
+    try {
+      body = await c.req.json();
+    } catch (_) {
+      body = await c.req.parseBody();
+    }
+
+    // 1. Resolve target provider mobile (Route Param > Header > Body)
+    const mobileParam = c.req.param("mobile");
+    const headerMobile = c.req.header("x-user-phone");
+    const targetMobile = (mobileParam || headerMobile || body.mobile || "").trim();
+
+    if (!targetMobile) {
+      return c.json({
+        success: false,
+        message: "Provider mobile number is required to perform an update.",
+      }, 400);
+    }
+
+    // 2. Extract allowed fields from payload
+    const {
+      name,
+      shopName,
+      email,
+      address,
+      pincode,
+      servicePincodes,
+      categories,
+      isAvailable,
+      operatingHours,
+      gstNumber,
+      upiId,
+      profileImageUrl,
+    } = body;
+
+    const providerUpdates = {};
+
+    if (name !== undefined) providerUpdates.name = String(name).trim();
+    if (shopName !== undefined) providerUpdates.shopName = String(shopName).trim();
+    if (email !== undefined) providerUpdates.email = String(email).trim().toLowerCase();
+    if (address !== undefined) providerUpdates.address = typeof address === "string" ? address.trim() : address;
+    if (pincode !== undefined) providerUpdates.pincode = String(pincode).trim();
+    if (isAvailable !== undefined) providerUpdates.isAvailable = Boolean(isAvailable);
+    if (operatingHours !== undefined) providerUpdates.operatingHours = String(operatingHours).trim();
+    if (gstNumber !== undefined) providerUpdates.gstNumber = String(gstNumber).trim();
+    if (upiId !== undefined) providerUpdates.upiId = String(upiId).trim();
+    if (profileImageUrl !== undefined) providerUpdates.profileImageUrl = String(profileImageUrl).trim();
+
+    if (Array.isArray(servicePincodes)) {
+      providerUpdates.servicePincodes = servicePincodes.map((p) => String(p).trim()).filter(Boolean);
+    }
+    if (Array.isArray(categories)) {
+      providerUpdates.categories = categories.map((cat) => String(cat).trim()).filter(Boolean);
+    }
+
+    if (Object.keys(providerUpdates).length === 0) {
+      return c.json({
+        success: false,
+        message: "No valid fields provided for update.",
+      }, 400);
+    }
+
+    providerUpdates.updatedAt = new Date();
+
+    // 3. Database operations: Update provider doc & sync name to users doc
+    const updatedProvider = await withDatabase(mongoUri, async (db) => {
+      const providerCollection = db.collection("service-providers");
+      const usersCollection = db.collection("users");
+
+      // Update service-providers collection
+      const providerResult = await providerCollection.findOneAndUpdate(
+        { mobile: targetMobile },
+        { $set: providerUpdates },
+        { returnDocument: "after" }
+      );
+
+      if (!providerResult) {
+        return null;
+      }
+
+      // Sync name to users collection if name was updated
+      if (providerUpdates.name) {
+        await usersCollection.updateOne(
+          {
+            $or: [
+              { mobile: targetMobile },
+              { "UserInfo.phoneNo": targetMobile },
+            ],
+          },
+          {
+            $set: {
+              name: providerUpdates.name,
+              "UserInfo.name": providerUpdates.name,
+              updatedAt: new Date(),
+            },
+          }
+        );
+      }
+
+      return providerResult;
+    });
+
+    if (!updatedProvider) {
+      return c.json({
+        success: false,
+        message: `Service provider with mobile '${targetMobile}' not found.`,
+      }, 404);
+    }
+
+    return c.json({
+      success: true,
+      message: "Provider profile and user name synced successfully.",
+      data: updatedProvider,
+    }, 200);
+
+  } catch (error) {
+    console.error("❌ Update Service Provider Error:", error);
+    return c.json({
+      success: false,
+      message: "Failed to update service provider details.",
+      error: error.message,
+    }, 500);
+  }
+};
 
 
 
