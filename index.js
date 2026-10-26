@@ -5,6 +5,7 @@ import { serve } from '@hono/node-server';
 import { requireAuth } from "./src/middleware/authMiddleware.js";
 import { rateLimiter } from "./src/middleware/rateLimiter.js";
 import { initializeApp, cert, applicationDefault, getApps } from 'firebase-admin/app';
+import { startQueueRunner } from "./src/controllers/queueController.js";
 import { metricsMiddleware } from "./src/middleware/metrics.js";
 import { ensureAuditLogIndexes } from "./src/utils/auditLogger.js";
 import { auditHttpMiddleware } from "./src/middleware/audit.middleware.js";
@@ -107,6 +108,8 @@ app.onError((err, c) => {
 
 const port = Number(process.env.PORT) || 5000;
 
+
+
 serve({
   fetch: app.fetch,
   port,
@@ -114,3 +117,5 @@ serve({
 }, (info) => {
   console.log(`🚀 ZHINI Backend Live on 0.0.0.0:${info.port}`);
 });
+
+startQueueRunner();
