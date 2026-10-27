@@ -4,18 +4,6 @@ import { notifyUserByMobile } from "../utils/fcmHelper.js";
 const MONGODB_URI = process.env.MONGODB_URI;
 
 
-
-
-import { notifyUserByMobile } from "../utils/fcmHelper.js";
-
-/**
- * 🛠️ Daily Warranty Expiry Notification Engine
- * - Scans devices with active warranty dates
- * - Calculates remaining calendar days relative to UTC midnight
- * - Dispatches FCM alerts on target milestones (30, 15, 7, 3, 1, 0)
- * - Stamps notified milestones via $addToSet to prevent duplicate alerts
- * - Reschedules the queue job in-place for 24 hours later
- */
 export const processDailyWarrantyExpiryJob = async (db, job) => {
   const devicesCollection = db.collection("devices");
   const jobsQueue = db.collection("jobs_queue");

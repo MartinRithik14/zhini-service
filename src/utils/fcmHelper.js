@@ -3,12 +3,7 @@ import { withDatabase } from '../utils/config.js';
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
-/**
- * 📲 Core Push Notification Sender using Firebase Admin Multicast
- * Supports both signatures:
- *   1. sendPushNotification(tokens, { title, body, data })
- *   2. sendPushNotification(tokens, title, body, dataPayload)
- */
+
 export const sendPushNotification = async (tokens = [], arg2, arg3, arg4 = {}) => {
   let title = "";
   let body = "";
