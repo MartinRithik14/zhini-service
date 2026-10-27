@@ -357,12 +357,12 @@ export const createProductSubmission = async (c) => {
       await homesCol.updateOne(
         { _id: targetHomeId },
         {
-          $addToSet: {             members: userId,             memberIds: userId           },$set: { updatedAt: now }
+          $addToSet: { members: userId, memberIds: userId },$set: { updatedAt: now }
         }
       );
 
       // STEP B: Find or Create Room on Demand
-      const escapedRoomName = targetRoomName.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&");
+      const escapedRoomName = targetRoomName.replace(/[-[\]{}()*+?.,\\^$\vert{}#\s]/g, "\\$&");
       let room = await roomsCol.findOne({
         $or: [
           { homeId: targetHomeId },
@@ -391,6 +391,7 @@ export const createProductSubmission = async (c) => {
         product: product.toString().trim(),
         brand: brand.toString().trim(),
         warranty: warranty || null,
+        notifiedMilestones: [], // 🔔 Initialized empty for warranty runner
         imageUrl: imageUrl,
         addedByUserId: userId,
         addedByUserMobile: cleanMobile,
@@ -580,12 +581,17 @@ export const updateEntity = async (c) => {
         }
       }
 
-      // 7. Update Device Details (Bug fixed: Wrapped in $and to prevent duplicate$or key collision)
+      // 7. Update Device Details
       if (deviceId && (product !== undefined || brand !== undefined || warranty !== undefined)) {
         const deviceUpdates = { updatedAt: now };
         if (product !== undefined) deviceUpdates.product = product.toString().trim();
         if (brand !== undefined) deviceUpdates.brand = brand.toString().trim();
-        if (warranty !== undefined) deviceUpdates.warranty = warranty;
+
+        // 🔄 When warranty date changes or is renewed, reset notified milestones
+        if (warranty !== undefined) {
+          deviceUpdates.warranty = warranty;
+          deviceUpdates.notifiedMilestones = [];
+        }
 
         const cleanDeviceIdStr = deviceId.toString().trim();
 
