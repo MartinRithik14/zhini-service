@@ -15,7 +15,6 @@ serviceRouter.put("/update-provider", updateServiceProvider);
 serviceRouter.get('/provider', getServiceProviderByMobile);
 
 serviceRouter.post('/create-ticket', createServiceTicket);
-
 serviceRouter.post('/provider-tickets', getProviderTickets);
 
 serviceRouter.put('/update-status', updateTicketStatus);
