@@ -1,234 +1,176 @@
 import { withDatabase } from "../utils/config.js";
-import { sendPushNotification, notifyUserByMobile } from "../utils/fcmHelper.js";
+import { notifyUserByMobile } from "../utils/fcmHelper.js";
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
-// Countdown milestones (days remaining until warranty expiry)
-const WARRANTY_MILESTONES = [30, 15, 7, 3, 1, 0];
+
+
+
+import { notifyUserByMobile } from "../utils/fcmHelper.js";
 
 /**
- * 🛠️ Daily Warranty Expiry Processor
+ * 🛠️ Daily Warranty Expiry Notification Engine
+ * - Scans devices with active warranty dates
+ * - Calculates remaining calendar days relative to UTC midnight
+ * - Dispatches FCM alerts on target milestones (30, 15, 7, 3, 1, 0)
+ * - Stamps notified milestones via $addToSet to prevent duplicate alerts
+ * - Reschedules the queue job in-place for 24 hours later
  */
 export const processDailyWarrantyExpiryJob = async (db, job) => {
-  console.log(`🔍 [Job: ${job._id}] Processing daily warranty expiry scan...`);
-
   const devicesCollection = db.collection("devices");
-  const usersCollection = db.collection("users");
-  const jobsCollection = db.collection("jobs_queue");
+  const jobsQueue = db.collection("jobs_queue");
 
   try {
-    // 1. Fetch all active devices that have valid warranty data
-    const devices = await devicesCollection.find({
-      warranty: { $exists: true, $nin: [null, "", "N/A", "UNDEFINED", "null"] }
-    }).toArray();
-
     const now = new Date();
-    // Normalize to midnight for accurate whole-day comparison
-    const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const todayMidnight = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+    );
 
-    let notificationsSent = 0;
+    const TARGET_MILESTONES = [30, 15, 7, 3, 1, 0];
+
+    const devices = await devicesCollection
+      .find({
+        warranty: { $exists: true, $nin: [null, "", "N/A"] },
+      })
+      .toArray();
+
+    let sentCount = 0;
 
     for (const device of devices) {
-      const warrantyDate = new Date(device.warranty);
-      if (isNaN(warrantyDate.getTime())) continue;
-
-      const expiryMidnight = new Date(
-        warrantyDate.getFullYear(),
-        warrantyDate.getMonth(),
-        warrantyDate.getDate()
-      );
-
-      // Calculate days remaining until expiry
-      const diffTime = expiryMidnight.getTime() - todayMidnight.getTime();
-      const daysRemaining = Math.round(diffTime / (1000 * 60 * 60 * 24));
-
-      // Skip past expiries older than day 0 or days outside our target cadence
-      if (!WARRANTY_MILESTONES.includes(daysRemaining)) {
-        continue;
-      }
-
-      // Check if this device already received notification for this specific milestone
-      const notifiedMilestones = Array.isArray(device.notifiedMilestones)
-        ? device.notifiedMilestones
-        : [];
-
-      if (notifiedMilestones.includes(daysRemaining)) {
-        continue;
-      }
-
-      // 2. Fetch user's registered FCM tokens via addedByUserMobile
-      const userMobile = device.addedByUserMobile;
+      const userMobile = device.addedByUserMobile || device.userMobile;
       if (!userMobile) continue;
 
-      const user = await usersCollection.findOne({
-        $or: [
-          { mobile: userMobile },
-          { "UserInfo.phoneNo": userMobile },
-          { _id: device.addedByUserId }
-        ]
-      });
+      const expiryDate = new Date(device.warranty);
+      if (isNaN(expiryDate.getTime())) continue;
 
-      // Extract device tokens from user document: PlatformInfo.devices[].fcmToken
-      const userDevices = user?.PlatformInfo?.devices || [];
-      const fcmTokens = userDevices
-        .map((d) => d.fcmToken)
-        .filter(Boolean);
-
-      if (fcmTokens.length === 0) {
-        console.warn(`⚠️ No active FCM token for user: ${userMobile} (Device: ${device.deviceId})`);
-        continue;
-      }
-
-      // 3. Draft dynamic message content based on the milestone
-      const productName = `${device.brand || ""} ${device.product || "Device"}`.trim();
-      let title = "";
-      let body = "";
-
-      if (daysRemaining > 1) {
-        title = `Warranty Expiry Alert ⚠️`;
-        body = `Warranty for your ${productName} expires in ${daysRemaining} days. Check coverage on Zhini.`;
-      } else if (daysRemaining === 1) {
-        title = `Warranty Expires Tomorrow! ⏳`;
-        body = `Tomorrow is the last day of official warranty for your ${productName}.`;
-      } else if (daysRemaining === 0) {
-        title = `Warranty Expired Today 🛡️`;
-        body = `Warranty for your ${productName} has expired today. Switch to Zhini Verified local service partners.`;
-      }
-
-      // 4. Dispatch FCM Push via shared helper
-      await sendPushNotification(fcmTokens, title, body, {
-        type: "WARRANTY_EXPIRY",
-        deviceId: device.deviceId || String(device._id),
-        daysRemaining: String(daysRemaining),
-        product: device.product || "",
-        brand: device.brand || "",
-      });
-
-      // 5. Record milestone on device to ensure idempotency
-      await devicesCollection.updateOne(
-        { _id: device._id },
-        {
-          $addToSet: { notifiedMilestones: daysRemaining },
-          $set: { lastWarrantyAlertAt: new Date(), updatedAt: new Date() }
-        }
+      const expiryMidnight = new Date(
+        Date.UTC(
+          expiryDate.getUTCFullYear(),
+          expiryDate.getUTCMonth(),
+          expiryDate.getUTCDate()
+        )
       );
 
-      notificationsSent++;
+      const diffTime = expiryMidnight.getTime() - todayMidnight.getTime();
+      const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
+
+      if (diffDays < 0 || diffDays > 30) continue;
+
+      if (TARGET_MILESTONES.includes(diffDays)) {
+        const alreadyNotified =
+          Array.isArray(device.notifiedMilestones) &&
+          device.notifiedMilestones.includes(diffDays);
+
+        if (!alreadyNotified) {
+          const deviceName = `${device.brand ? device.brand + " " : ""}${
+            device.product || "Device"
+          }`.trim();
+
+          const title =
+            diffDays === 0
+              ? `Warranty Expires Today! ⚠️`
+              : `Warranty Expiring in ${diffDays} Days! ⚠️`;
+
+          const body =
+            diffDays === 0
+              ? `Your ${deviceName} warranty expires today. Tap to check details.`
+              : `Your ${deviceName} warranty expires in ${diffDays} days. Tap to check details.`;
+
+          await notifyUserByMobile(userMobile.toString().trim(), {
+            title,
+            body,
+            data: {
+              type: "WARRANTY_EXPIRY",
+              deviceId: String(device.deviceId || device._id),
+              daysRemaining: String(diffDays),
+            },
+          }).catch((err) =>
+            console.error(
+              `⚠️ [FCM Failed] User ${userMobile}:`,
+              err.message
+            )
+          );
+
+          await devicesCollection.updateOne(
+            { _id: device._id },
+            {
+              $addToSet: { notifiedMilestones: diffDays },
+              $set: { updatedAt: new Date() },
+            }
+          );
+
+          sentCount++;
+        }
+      }
     }
 
-    console.log(`✅ [Job: ${job._id}] Finished warranty scan. Dispatched ${notificationsSent} notification(s).`);
+    console.log(
+      `[WARRANTY JOB] Scan completed. Candidate devices: ${devices.length} | Dispatched: ${sentCount}`
+    );
 
-    // 6. Complete and Reschedule Job for next run (24 hours later)
-    const nextRun = new Date(Date.now() + 24 * 60 * 60 * 1000);
-
-    await jobsCollection.updateOne(
+    // Reschedule for next 24-hour cycle
+    await jobsQueue.updateOne(
       { _id: job._id },
       {
         $set: {
           status: "pending",
-          lastRunAt: now,
-          runAt: nextRun,
+          runAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+          lastRunAt: new Date(),
           lockedAt: null,
-          lastRunSummary: {
-            notificationsDispatched: notificationsSent,
-            completedAt: new Date()
-          }
-        }
+          lastError: null,
+        },
       }
     );
-
   } catch (error) {
-    console.error(`❌ [Job: ${job._id}] Failed to process warranty expiry job:`, error);
-    await jobsCollection.updateOne(
+    console.error("❌ [WARRANTY JOB] Execution error:", error.message);
+
+    // Unlock and retry after a 5-minute backoff
+    await jobsQueue.updateOne(
       { _id: job._id },
       {
         $set: {
-          status: "failed",
-          failedAt: new Date(),
-          errorReason: error.message
-        }
+          status: "pending",
+          runAt: new Date(Date.now() + 5 * 60 * 1000),
+          lockedAt: null,
+          lastError: error.message,
+        },
       }
     );
   }
 };
 
-/**
- * ⏳ Mongo Queue Runner Started (Background Engine for Zhini)
- */
 export const startQueueRunner = () => {
-  console.log("⏳ Zhini Mongo Queue Runner Started...");
+  console.log("🚀 Zhini Queue Runner initialized (Polling every 30s)");
 
   setInterval(async () => {
     try {
       const now = new Date();
-
-      if (!MONGODB_URI) {
-        console.error("⚠️ Master Queue Runner: MONGODB_URI configuration string is completely missing.");
-        return;
-      }
+      if (!MONGODB_URI) return;
 
       await withDatabase(MONGODB_URI, async (db) => {
-        // Find pending jobs ready to run
-        const job = await db.collection("jobs_queue").findOneAndUpdate(
+        const result = await db.collection("jobs_queue").findOneAndUpdate(
           {
             status: "pending",
-            runAt: { $lte: now }
+            runAt: { $lte: now },
           },
           {
-            $set: { status: "processing", lockedAt: now }
+            $set: { status: "processing", lockedAt: now },
           },
           {
-            returnDocument: "after"
+            returnDocument: "after",
           }
         );
 
-        if (!job) return;
+        const activeJob = result?.value !== undefined ? result.value : result;
+        if (!activeJob) return;
 
-        console.log(`🚀 Found active task to run: [${job.taskType}] (ID: ${job._id})`);
-
-        // 🔀 TASK ROUTER
-        switch (job.taskType) {
-          case "DAILY_WARRANTY_EXPIRY_CHECK":
-            await processDailyWarrantyExpiryJob(db, job);
-            break;
-
-          default:
-            console.log(`⚠️ Unknown task type encountered: ${job.taskType}`);
-            await db.collection("jobs_queue").updateOne(
-              { _id: job._id },
-              { $set: { status: "failed", reason: "Unknown task type", lockedAt: null } }
-            );
+        if (activeJob.taskType === "DAILY_WARRANTY_EXPIRY_CHECK") {
+          await processDailyWarrantyExpiryJob(db, activeJob);
         }
       });
-
     } catch (error) {
-      console.error("❌ Error in Zhini Queue Runner loop:", error.message);
+      console.error("❌ Queue Runner Loop Error:", error.message);
     }
-  }, 30000); // Polls every 30 seconds
+  }, 30000);
 };
 
-/**
- * 🧪 Test Runner: Directly fires a push notification to a specific mobile number using notifyUserByMobile
- */
-export const testDirectNotification = async (targetMobile = "9342639912") => {
-  console.log(`\n🧪 [TEST NOTIFICATION] Starting test for mobile: ${targetMobile}...`);
-
-  try {
-    const response = await notifyUserByMobile(targetMobile, {
-      title: "Zhini Test Alert 🔔",
-      body: "Your FCM notification pipeline is active and working!",
-      data: {
-        type: "TEST_ALERT",
-        timestamp: new Date().toISOString()
-      }
-    });
-
-    if (response && response.successCount > 0) {
-      console.log(`🎉 [TEST NOTIFICATION] Successfully delivered test notification to mobile: ${targetMobile}\n`);
-    } else {
-      console.error(`❌ [TEST NOTIFICATION] Message dispatch failed or no tokens found.`);
-    }
-  } catch (error) {
-    console.error("❌ [TEST NOTIFICATION] Error executing test function:", error.message);
-  }
-};
