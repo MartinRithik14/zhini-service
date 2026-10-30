@@ -19,11 +19,13 @@ export const sendPushNotification = async (tokens = [], arg2, arg3, arg4 = {}) =
     data = arg4 || {};
   }
 
-  const validTokens = [...new Set(
-    (Array.isArray(tokens) ? tokens : [tokens]).filter(
-      (t) => typeof t === 'string' && t.trim().length > 0
-    )
-  )];
+  const validTokens = [
+    ...new Set(
+      (Array.isArray(tokens) ? tokens : [tokens]).filter(
+        (t) => typeof t === "string" && t.trim().length > 0
+      )
+    ),
+  ];
 
   if (validTokens.length === 0) {
     console.log("ℹ️ [FCM] No valid FCM tokens available to dispatch notification.");
@@ -37,15 +39,49 @@ export const sendPushNotification = async (tokens = [], arg2, arg3, arg4 = {}) =
   }, {});
 
   const message = {
-    notification: { title, body },
+    notification: {
+      title,
+      body,
+    },
     data: sanitizedData,
     tokens: validTokens,
+
+    // 🍎 iOS / APNs Configuration
+    apns: {
+      headers: {
+        "apns-priority": "10", // High priority: immediate delivery
+        "apns-push-type": "alert",
+      },
+      payload: {
+        aps: {
+          alert: {
+            title,
+            body,
+          },
+          sound: "default",
+          badge: 1,
+          "content-available": 1, // Wakes up background handlers if needed
+        },
+      },
+    },
+
+    // 🤖 Android Configuration
+    android: {
+      priority: "high",
+      notification: {
+        sound: "default",
+        defaultSound: true,
+        defaultVibrateTimings: true,
+      },
+    },
   };
 
   try {
     const messaging = getMessaging(); // Binds to initialized default app
     const response = await messaging.sendEachForMulticast(message);
-    console.log(`📲 [FCM] Dispatched: ${response.successCount} success, ${response.failureCount} failed.`);
+    console.log(
+      `📲 [FCM] Dispatched: ${response.successCount} success, ${response.failureCount} failed.`
+    );
     return response;
   } catch (err) {
     console.error("❌ [FCM] Send Error:", err.message);
