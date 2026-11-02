@@ -309,7 +309,10 @@ export const createProductSubmission = async (c) => {
     // 2. Parse multipart/form-data request
     const body = await c.req.parseBody();
     const { homeId, roomName, product, brand, warranty } = body;
-    const file = body.file; // Uploaded File object or undefined
+    
+    // File inputs: product image and warranty document
+    const productFile = body.file || body.productImage;
+    const warrantyFile = body.warrantyFile || body.warrantyImage;
 
     // 3. Validation
     if (!homeId || !product || !brand) {
@@ -330,14 +333,34 @@ export const createProductSubmission = async (c) => {
     const targetHomeId = new ObjectId(cleanHomeId);
     const targetRoomName = (roomName || "Default Room").toString().trim();
 
-    // 4. Handle Cloudflare R2 Image Upload
-    let imageUrl = null;
-    if (file && typeof file !== "string" && file.name) {
-      imageUrl = await uploadToR2(file, {
-        homeId: cleanHomeId,
-        folder: "product-images"
-      });
+    // 4. Handle Cloudflare R2 Uploads (in parallel)
+    const uploadTasks = [];
+
+    // Product image upload task
+    if (productFile && typeof productFile !== "string" && productFile.name) {
+      uploadTasks.push(
+        uploadToR2(productFile, {
+          homeId: cleanHomeId,
+          folder: "product-images"
+        })
+      );
+    } else {
+      uploadTasks.push(Promise.resolve(null));
     }
+
+    // Warranty file upload task
+    if (warrantyFile && typeof warrantyFile !== "string" && warrantyFile.name) {
+      uploadTasks.push(
+        uploadToR2(warrantyFile, {
+          homeId: cleanHomeId,
+          folder: "warranty-images"
+        })
+      );
+    } else {
+      uploadTasks.push(Promise.resolve(null));
+    }
+
+    const [imageUrl, warrantyUrl] = await Promise.all(uploadTasks);
 
     // 5. Database Operations
     const result = await withDatabase(mongoUri, async (db) => {
@@ -357,7 +380,8 @@ export const createProductSubmission = async (c) => {
       await homesCol.updateOne(
         { _id: targetHomeId },
         {
-          $addToSet: { members: userId, memberIds: userId },$set: { updatedAt: now }
+          $addToSet: { members: userId, memberIds: userId },
+          $set: { updatedAt: now }
         }
       );
 
@@ -393,6 +417,7 @@ export const createProductSubmission = async (c) => {
         warranty: warranty || null,
         notifiedMilestones: [], // 🔔 Initialized empty for warranty runner
         imageUrl: imageUrl,
+        warrantyUrl: warrantyUrl, // 📄 Saved warranty document / image link
         addedByUserId: userId,
         addedByUserMobile: cleanMobile,
         createdAt: now,
@@ -408,7 +433,8 @@ export const createProductSubmission = async (c) => {
         roomId: room._id,
         roomName: room.roomName,
         userId: userId,
-        imageUrl: imageUrl
+        imageUrl: imageUrl,
+        warrantyUrl: warrantyUrl
       };
     });
 
@@ -958,7 +984,10 @@ export const AIassist = async (c) => {
       return c.json({ success: false, message: "No imageBase64 provided" }, 400);
     }
 
-    // 4. Resolve and normalize caller's phone number
+    // Strip data URI prefix if present
+    const cleanBase64 = imageBase64.replace(/^data:image\/[a-z]+;base64,/, "");
+
+    // Resolve and normalize caller's phone number
     const currentUser = c.get("user");
     const rawMobile =
       currentUser?.mobile ||
@@ -969,7 +998,6 @@ export const AIassist = async (c) => {
       bodyMobile ||
       "";
 
-    // Strip out non-digit characters and standard prefixes (e.g. +91 or leading 0)
     const cleanMobile = rawMobile
       .toString()
       .replace(/\D/g, "")
@@ -977,8 +1005,14 @@ export const AIassist = async (c) => {
 
     const isTestUser = TEST_NUMBERS.has(cleanMobile);
 
-    const promptText =
-      "Identify the appliance in this image. Return ONLY a raw JSON object with exactly two keys: 'brand' and 'product'. Example: {\"brand\": \"Samsung\", \"product\": \"Washing Machine\"}";
+    const promptText = `Identify the object in the image.
+Allowed categories: Serviceable home appliances, electronics, electrical fittings, or plumbing (e.g., TV, Fridge, AC, Washing Machine, Geyser, Fan, Tap).
+
+If the object does NOT belong to these categories (e.g., dustbin, furniture, clothing, food, trash), return:
+{"brand": null, "product": null}
+
+If valid, return a raw JSON object with keys "brand" (string or null) and "product" (standardized name).
+Return ONLY the raw JSON object, no markdown.`;
 
     let responseText;
 
@@ -1000,7 +1034,7 @@ export const AIassist = async (c) => {
           {
             inlineData: {
               mimeType: mimeType,
-              data: imageBase64,
+              data: cleanBase64,
             },
           },
           promptText,
@@ -1011,13 +1045,13 @@ export const AIassist = async (c) => {
       });
 
       responseText = response.text;
-    } 
+    }
     // -------------------------------------------------------------
-    // SCENARIO B: TEST USER (1111111111 - 5555555555) -> Rotating Free Keys
+    // SCENARIO B: TEST USER -> Rotating Free Keys
     // -------------------------------------------------------------
     else {
       if (FREE_GEMINI_KEYS.length === 0) {
-        return c.json({ success: false, message: "No free-tier testing API keys configured!!!" }, 500);
+        return c.json({ success: false, message: "No free-tier testing API keys configured." }, 500);
       }
 
       console.log(`🧪 Test User (${cleanMobile}): Routing to Free-Tier Rotating Keys`);
@@ -1036,7 +1070,7 @@ export const AIassist = async (c) => {
               {
                 inlineData: {
                   mimeType: mimeType,
-                  data: imageBase64,
+                  data: cleanBase64,
                 },
               },
               promptText,
@@ -1048,18 +1082,18 @@ export const AIassist = async (c) => {
 
           responseText = response.text;
           console.log("✅ Free Gemini Key execution successful!");
-          break; // Exit loop on success
+          break;
         } catch (err) {
-  console.warn(`⚠️ Free Gemini key index ${currentFreeKeyIndex} failed: ${err.message}`);
-  const status = err.status || err.code;
-  if (status === 429 || /quota|rate/i.test(err.message)) {
-    geminiAttempts++;
-    currentFreeKeyIndex = (currentFreeKeyIndex + 1) % FREE_GEMINI_KEYS.length;
-  } else {
-    throw err;
-  }
-}
-}
+          console.warn(`⚠️ Free Gemini key index ${currentFreeKeyIndex} failed: ${err.message}`);
+          const status = err.status || err.code;
+          if (status === 429 || /quota|rate/i.test(err.message)) {
+            geminiAttempts++;
+            currentFreeKeyIndex = (currentFreeKeyIndex + 1) % FREE_GEMINI_KEYS.length;
+          } else {
+            throw err;
+          }
+        }
+      }
 
       if (!responseText) {
         return c.json(
@@ -1069,9 +1103,23 @@ export const AIassist = async (c) => {
       }
     }
 
-    // 5. Parse and return result
+    // Parse output safely
+   // Parse output safely
     const cleanedText = responseText.replace(/```json|```/g, "").trim();
-    const parsedResult = JSON.parse(cleanedText);
+    let parsedResult;
+    try {
+      parsedResult = JSON.parse(cleanedText);
+    } catch (_) {
+      parsedResult = { brand: null, product: null };
+    }
+
+    // Check if the model identified a valid serviceable appliance
+    if (!parsedResult.product) {
+      return c.json({
+        success: false,
+        message: "Item not recognized as a serviceable appliance. Please take a clear picture of a supported electronic or appliance.",
+      }, 400);
+    }
 
     return c.json({
       success: true,
