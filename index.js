@@ -59,7 +59,7 @@ const app = new Hono();
 app.use('*', cors());
 ensureAuditLogIndexes();
 // 2. Health check (kept open for monitoring checks)
-app.get('/', (c) => c.json({ status: 'ok', message: 'ZHINI API Live' }));
+app.get('/', (c) => c.json({ status: 'ok', message: 'ZHINI API Livee' }));
 
 // 3. Prometheus Metrics Middleware (observes duration & counts requests)
 app.use("*", metricsMiddleware);
