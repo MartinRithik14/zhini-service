@@ -307,12 +307,24 @@ export const createProductSubmission = async (c) => {
     const cleanMobile = currentUser.mobile || currentUser?.UserInfo?.phoneNo;
 
     // 2. Parse multipart/form-data request
-    const body = await c.req.parseBody();
-    const { homeId, roomName, product, brand, warranty } = body;
-    
-    // File inputs: product image and warranty document
+    const body = await c.req.parseBody({ all: true });
+    const { homeId, roomName, product, brand, warranty, notificationsEnabled } = body;
+
+    // File inputs: product image, warranty document, and miscellaneous images
     const productFile = body.file || body.productImage;
     const warrantyFile = body.warrantyFile || body.warrantyImage;
+    
+    // Normalize "others" input into an array of files
+    const rawOthers = body.others || body.otherFiles || body.otherFile || [];
+    const otherFiles = (Array.isArray(rawOthers) ? rawOthers : [rawOthers]).filter(
+      (f) => f && typeof f !== "string" && f.name
+    );
+
+    // Parse notification toggle preference (defaults to true if not passed)
+    const isNotificationsEnabled =
+      notificationsEnabled !== undefined
+        ? String(notificationsEnabled).toLowerCase() !== "false"
+        : true;
 
     // 3. Validation
     if (!homeId || !product || !brand) {
@@ -334,33 +346,30 @@ export const createProductSubmission = async (c) => {
     const targetRoomName = (roomName || "Default Room").toString().trim();
 
     // 4. Handle Cloudflare R2 Uploads (in parallel)
-    const uploadTasks = [];
+    const productUploadTask =
+      productFile && typeof productFile !== "string" && productFile.name
+        ? uploadToR2(productFile, { homeId: cleanHomeId, folder: "product-images" })
+        : Promise.resolve(null);
 
-    // Product image upload task
-    if (productFile && typeof productFile !== "string" && productFile.name) {
-      uploadTasks.push(
-        uploadToR2(productFile, {
-          homeId: cleanHomeId,
-          folder: "product-images"
-        })
-      );
-    } else {
-      uploadTasks.push(Promise.resolve(null));
-    }
+    const warrantyUploadTask =
+      warrantyFile && typeof warrantyFile !== "string" && warrantyFile.name
+        ? uploadToR2(warrantyFile, { homeId: cleanHomeId, folder: "warranty-images" })
+        : Promise.resolve(null);
 
-    // Warranty file upload task
-    if (warrantyFile && typeof warrantyFile !== "string" && warrantyFile.name) {
-      uploadTasks.push(
-        uploadToR2(warrantyFile, {
-          homeId: cleanHomeId,
-          folder: "warranty-images"
-        })
-      );
-    } else {
-      uploadTasks.push(Promise.resolve(null));
-    }
+    const othersUploadTask =
+      otherFiles.length > 0
+        ? Promise.all(
+            otherFiles.map((f) =>
+              uploadToR2(f, { homeId: cleanHomeId, folder: "others" })
+            )
+          )
+        : Promise.resolve([]);
 
-    const [imageUrl, warrantyUrl] = await Promise.all(uploadTasks);
+    const [imageUrl, warrantyUrl, otherUrls] = await Promise.all([
+      productUploadTask,
+      warrantyUploadTask,
+      othersUploadTask,
+    ]);
 
     // 5. Database Operations
     const result = await withDatabase(mongoUri, async (db) => {
@@ -416,8 +425,10 @@ export const createProductSubmission = async (c) => {
         brand: brand.toString().trim(),
         warranty: warranty || null,
         notifiedMilestones: [], // 🔔 Initialized empty for warranty runner
+        notificationsEnabled: isNotificationsEnabled, // 🔔 Boolean notification preference
         imageUrl: imageUrl,
         warrantyUrl: warrantyUrl, // 📄 Saved warranty document / image link
+        otherUrls: otherUrls, // 📁 Array of URLs uploaded to "others" folder
         addedByUserId: userId,
         addedByUserMobile: cleanMobile,
         createdAt: now,
@@ -433,8 +444,10 @@ export const createProductSubmission = async (c) => {
         roomId: room._id,
         roomName: room.roomName,
         userId: userId,
+        notificationsEnabled: isNotificationsEnabled,
         imageUrl: imageUrl,
-        warrantyUrl: warrantyUrl
+        warrantyUrl: warrantyUrl,
+        otherUrls: otherUrls
       };
     });
 
@@ -478,7 +491,8 @@ export const updateEntity = async (c) => {
       deviceId,
       product,
       brand,
-      warranty
+      warranty,
+      notificationsEnabled // 🔔 Added field
     } = body;
 
     // 2. Validate mandatory root anchor
@@ -608,7 +622,13 @@ export const updateEntity = async (c) => {
       }
 
       // 7. Update Device Details
-      if (deviceId && (product !== undefined || brand !== undefined || warranty !== undefined)) {
+      if (
+        deviceId &&
+        (product !== undefined ||
+          brand !== undefined ||
+          warranty !== undefined ||
+          notificationsEnabled !== undefined)
+      ) {
         const deviceUpdates = { updatedAt: now };
         if (product !== undefined) deviceUpdates.product = product.toString().trim();
         if (brand !== undefined) deviceUpdates.brand = brand.toString().trim();
@@ -617,6 +637,14 @@ export const updateEntity = async (c) => {
         if (warranty !== undefined) {
           deviceUpdates.warranty = warranty;
           deviceUpdates.notifiedMilestones = [];
+        }
+
+        // 🔔 Handle notificationsEnabled toggle (boolean or string parsing)
+        if (notificationsEnabled !== undefined) {
+          deviceUpdates.notificationsEnabled =
+            typeof notificationsEnabled === "boolean"
+              ? notificationsEnabled
+              : String(notificationsEnabled).trim().toLowerCase() === "true";
         }
 
         const cleanDeviceIdStr = deviceId.toString().trim();

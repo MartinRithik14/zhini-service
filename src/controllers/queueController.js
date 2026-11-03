@@ -16,9 +16,12 @@ export const processDailyWarrantyExpiryJob = async (db, job) => {
 
     const TARGET_MILESTONES = [30, 15, 7, 3, 1, 0];
 
+    // Query filters out devices where user opted out (notificationsEnabled === false)
+    // Devices with true or undefined/null (legacy data) will continue to be notified
     const devices = await devicesCollection
       .find({
         warranty: { $exists: true, $nin: [null, "", "N/A"] },
+        notificationsEnabled: { $ne: false },
       })
       .toArray();
 
