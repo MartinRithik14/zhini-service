@@ -308,17 +308,37 @@ export const createProductSubmission = async (c) => {
 
     // 2. Parse multipart/form-data request
     const body = await c.req.parseBody({ all: true });
-    const { homeId, roomName, product, brand, warranty, notificationsEnabled } = body;
+    const {
+      homeId,
+      roomName,
+      modelNumber,
+      serialNumber,
+      purchasedShopName,
+      shopWarranty,
+      product,
+      brand,
+      warranty,
+      notificationsEnabled
+    } = body;
 
-    // File inputs: product image, warranty document, and miscellaneous images
+    // Primary file inputs: product image and warranty document
     const productFile = body.file || body.productImage;
     const warrantyFile = body.warrantyFile || body.warrantyImage;
-    
-    // Normalize "others" input into an array of files
-    const rawOthers = body.others || body.otherFiles || body.otherFile || [];
-    const otherFiles = (Array.isArray(rawOthers) ? rawOthers : [rawOthers]).filter(
-      (f) => f && typeof f !== "string" && f.name
-    );
+
+    // 📁 Catch-all for "others": checks standard keys first, plus any other arbitrary file sent in body
+    const primaryFileKeys = new Set(["file", "productImage", "warrantyFile", "warrantyImage"]);
+    const otherFiles = [];
+
+    for (const [key, val] of Object.entries(body)) {
+      if (primaryFileKeys.has(key)) continue;
+
+      const items = Array.isArray(val) ? val : [val];
+      for (const item of items) {
+        if (item && typeof item !== "string" && item.name) {
+          otherFiles.push(item);
+        }
+      }
+    }
 
     // Parse notification toggle preference (defaults to true if not passed)
     const isNotificationsEnabled =
@@ -368,7 +388,7 @@ export const createProductSubmission = async (c) => {
     const [imageUrl, warrantyUrl, otherUrls] = await Promise.all([
       productUploadTask,
       warrantyUploadTask,
-      othersUploadTask,
+      othersUploadTask
     ]);
 
     // 5. Database Operations
@@ -423,6 +443,10 @@ export const createProductSubmission = async (c) => {
         roomId: room._id,
         product: product.toString().trim(),
         brand: brand.toString().trim(),
+        serialNumber: serialNumber ? serialNumber.toString().trim() : null,
+        modelNumber: modelNumber ? modelNumber.toString().trim() : null,
+        purchasedShopName: purchasedShopName ? purchasedShopName.toString().trim() : null,
+        shopWarranty: shopWarranty ? shopWarranty.toString().trim() : null,
         warranty: warranty || null,
         notifiedMilestones: [], // 🔔 Initialized empty for warranty runner
         notificationsEnabled: isNotificationsEnabled, // 🔔 Boolean notification preference
@@ -477,7 +501,20 @@ export const updateEntity = async (c) => {
     }
     const currentUserId = currentUser._id;
 
-    const body = await c.req.json().catch(async () => await c.req.parseBody());
+    // 🛡️ Safe body parsing based on Content-Type header
+    const contentType = c.req.header("content-type") || "";
+    let body = {};
+
+    if (contentType.includes("application/json")) {
+      body = await c.req.json().catch(() => ({}));
+    } else if (
+      contentType.includes("multipart/form-data") ||
+      contentType.includes("application/x-www-form-urlencoded")
+    ) {
+      body = await c.req.parseBody({ all: true }).catch(() => ({}));
+    } else {
+      body = await c.req.json().catch(async () => await c.req.parseBody({ all: true }).catch(() => ({})));
+    }
 
     const {
       homeId,
@@ -492,7 +529,11 @@ export const updateEntity = async (c) => {
       product,
       brand,
       warranty,
-      notificationsEnabled // 🔔 Added field
+      notificationsEnabled,
+      modelNumber,
+      serialNumber,
+      purchasedShopName,
+      shopWarranty
     } = body;
 
     // 2. Validate mandatory root anchor
@@ -627,11 +668,15 @@ export const updateEntity = async (c) => {
         (product !== undefined ||
           brand !== undefined ||
           warranty !== undefined ||
-          notificationsEnabled !== undefined)
+          notificationsEnabled !== undefined ||
+          modelNumber !== undefined ||
+          serialNumber !== undefined ||
+          purchasedShopName !== undefined ||
+          shopWarranty !== undefined)
       ) {
         const deviceUpdates = { updatedAt: now };
-        if (product !== undefined) deviceUpdates.product = product.toString().trim();
-        if (brand !== undefined) deviceUpdates.brand = brand.toString().trim();
+        if (product !== undefined) deviceUpdates.product = product ? product.toString().trim() : null;
+        if (brand !== undefined) deviceUpdates.brand = brand ? brand.toString().trim() : null;
 
         // 🔄 When warranty date changes or is renewed, reset notified milestones
         if (warranty !== undefined) {
@@ -645,6 +690,20 @@ export const updateEntity = async (c) => {
             typeof notificationsEnabled === "boolean"
               ? notificationsEnabled
               : String(notificationsEnabled).trim().toLowerCase() === "true";
+        }
+
+        // 📦 Hardware & Purchase Details
+        if (modelNumber !== undefined) {
+          deviceUpdates.modelNumber = modelNumber ? modelNumber.toString().trim() : null;
+        }
+        if (serialNumber !== undefined) {
+          deviceUpdates.serialNumber = serialNumber ? serialNumber.toString().trim() : null;
+        }
+        if (purchasedShopName !== undefined) {
+          deviceUpdates.purchasedShopName = purchasedShopName ? purchasedShopName.toString().trim() : null;
+        }
+        if (shopWarranty !== undefined) {
+          deviceUpdates.shopWarranty = shopWarranty ? shopWarranty.toString().trim() : null;
         }
 
         const cleanDeviceIdStr = deviceId.toString().trim();
