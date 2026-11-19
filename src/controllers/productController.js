@@ -9,6 +9,90 @@ import crypto from 'crypto';
 
 const mongoUri = process.env.MONGODB_URI;
 
+export const getTemplate = async (c) => {
+  try {
+    // Extract the dynamic id from the URL parameters
+    const id = c.req.param('id');
+
+    if (!id) {
+      return c.json({ error: "Template ID param is required!" }, 400);
+    }
+
+    return await withDatabase(mongoUri, async (db) => {
+      const template = await db.collection("templates").findOne({ id });
+
+      if (!template) {
+        return c.json({ error: `Template '${id}' not found!` }, 404);
+      }
+
+      return c.json(template);
+    });
+
+  } catch (err) {
+    return c.json({ error: err.message }, 500);
+  }
+};
+
+let cachedBanners = null;
+let lastFetchedAt = 0;
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes cache
+
+export const getBanners = async (c) => {
+  try {
+    const now = Date.now();
+
+    // 1. Return cached list if fetched within the last 5 minutes
+    if (cachedBanners && now - lastFetchedAt < CACHE_TTL_MS) {
+      return c.json({
+        success: true,
+        banners: cachedBanners,
+      }, 200);
+    }
+
+    // 2. Fetch the live raw JSON directly from your public GitHub repo
+    const GITHUB_BANNERS_URL =
+      process.env.GITHUB_BANNERS_RAW_URL ||
+      "https://raw.githubusercontent.com/zhini-co-in/zhini-web/main/assets/banners.json";
+
+    const response = await fetch(GITHUB_BANNERS_URL, {
+      headers: {
+        "User-Agent": "Zhini-Backend-Service",
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch from GitHub: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+
+    // 3. Filter only active banners (if isActive is defined)
+    const activeBanners = Array.isArray(data)
+      ? data.filter((b) => b && b.isActive !== false)
+      : [];
+
+    // Save to cache
+    cachedBanners = activeBanners;
+    lastFetchedAt = now;
+
+    return c.json({
+      success: true,
+      banners: activeBanners,
+    }, 200);
+
+  } catch (error) {
+    console.error("❌ Banner fetch error:", error.message);
+
+    // If GitHub has a temporary glitch, return stale cache or empty list
+    return c.json({
+      success: true,
+      banners: cachedBanners || [],
+    }, 200);
+  }
+};
+
+
+
 export const syncUserSession = async (c) => {
   try {
     const incomingSecurityToken =

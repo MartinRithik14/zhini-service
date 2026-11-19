@@ -1,10 +1,12 @@
 import { Hono } from 'hono';
-import { createHome,commonDelete,shiftDevices,syncUserSession,createProductSubmission,getSubmissionByMobile,AIassist,addMember,updateEntity } from '../controllers/productController.js';
+import { createHome,getBanners,getTemplate,commonDelete,shiftDevices,syncUserSession,createProductSubmission,getSubmissionByMobile,AIassist,addMember,updateEntity } from '../controllers/productController.js';
 
 const productRouter = new Hono();
 
 // POST endpoint mapping
 productRouter.post('/home', createHome);
+productRouter.get('/banners', getBanners);
+productRouter.get('/template/:id', getTemplate);
 productRouter.delete('/delete', commonDelete);
 productRouter.post('/shift-devices', shiftDevices);
 productRouter.post('/session', syncUserSession);
