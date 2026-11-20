@@ -976,6 +976,190 @@ export const commonDelete = async (c) => {
   }
 };
 
+
+/**
+ * Helper to delete a file key from Cloudflare R2 given its public/signed URL
+ */
+const deleteFileFromR2 = async (fileUrl, env) => {
+  try {
+    if (!fileUrl || typeof fileUrl !== "string") return;
+    
+    // Extract key path after the domain
+    // Example: https://pub-xxxx.r2.dev/homes/123/product-images/abc.jpg -> homes/123/product-images/abc.jpg
+    const parsedUrl = new URL(fileUrl);
+    const key = decodeURIComponent(parsedUrl.pathname.replace(/^\/+/, ""));
+    
+    if (key && env?.MY_BUCKET?.delete) {
+      await env.MY_BUCKET.delete(key);
+    }
+  } catch (err) {
+    console.warn(`⚠️ Failed to remove R2 object (${fileUrl}):`, err.message);
+  }
+};
+
+export const deleteAccount = async (c) => {
+  try {
+    // 🛡️ 1. Extract verified mobile strictly from authenticated token/context
+    const authUser = c.get("user");
+    const rawMobile = authUser?.mobile || authUser?.phone_number || authUser?.UserInfo?.phoneNo || "";
+    const cleanMobile = String(rawMobile).replace(/\D/g, "").slice(-10);
+
+    if (cleanMobile.length !== 10) {
+      return c.json({ success: false, message: "Unauthorized: Invalid or missing phone number." }, 401);
+    }
+
+    const summary = await withDatabase(mongoUri, async (db) => {
+      const users = db.collection("users");
+      const homes = db.collection("homes");
+      const devices = db.collection("devices");
+      const rooms = db.collection("rooms");
+      const queue = db.collection("notification_queue");
+
+      // Locate user profile
+      const user = await users.findOne({
+        $or: [
+          { mobile: cleanMobile },
+          { mobile: `+91${cleanMobile}` },
+          { phone: cleanMobile },
+          { "UserInfo.phoneNo": cleanMobile }
+        ]
+      });
+
+      // Build all possible references representing this user
+      const memberRefs = [
+        cleanMobile,
+        `+91${cleanMobile}`,
+        ...(user ? [user._id, String(user._id)] : [])
+      ];
+      
+      const isMe = (m) => memberRefs.some((r) => String(r) === String(m));
+
+      // Find all homes where this user is a member or owner
+      const myHomes = await homes.find({
+        $or: [
+          { members: { $in: memberRefs } },
+          { memberIds: { $in: memberRefs } },
+          ...(user ? [{ ownerId: user._id }, { ownerId: String(user._id) }] : [])
+        ]
+      }).toArray();
+
+      let homesDeleted = 0;
+      let homesLeft = 0;
+      let devicesDeletedCount = 0;
+      const filesToDelete = [];
+
+      for (const home of myHomes) {
+        // Collect all distinct members from both array fields
+        const allMembers = [
+          ...(home.members || []),
+          ...(home.memberIds || [])
+        ];
+        
+        const otherMembers = allMembers.filter((m) => !isMe(m));
+
+        // 👨‍👩‍👧‍👦 Scenario A: Home has other members -> Just remove the user
+        if (otherMembers.length > 0) {
+          await homes.updateOne(
+            { _id: home._id },
+            {
+              $pull: {
+                members: { $in: memberRefs },
+                memberIds: { $in: memberRefs }
+              }
+            }
+          );
+          homesLeft++;
+          continue;
+        }
+
+        // 💥 Scenario B: Solo owner/member -> Aggressively wipe the entire home tree
+        const homeKeys = [
+          home._id,
+          String(home._id),
+          ...(home.homeId ? [home.homeId, String(home.homeId)] : [])
+        ];
+
+        // 1. Fetch devices and gather R2 files to delete
+        const homeDevices = await devices
+          .find({ homeId: { $in: homeKeys } })
+          .project({ _id: 1, deviceId: 1, imageUrl: 1, warrantyUrl: 1, otherUrls: 1 })
+          .toArray();
+
+        const deviceKeys = [];
+        for (const dev of homeDevices) {
+          deviceKeys.push(dev._id, String(dev._id));
+          if (dev.deviceId) deviceKeys.push(dev.deviceId);
+
+          // Collect file links
+          if (dev.imageUrl) filesToDelete.push(dev.imageUrl);
+          if (dev.warrantyUrl) filesToDelete.push(dev.warrantyUrl);
+          if (Array.isArray(dev.otherUrls)) filesToDelete.push(...dev.otherUrls);
+        }
+
+        // 2. Remove pending notification jobs
+        if (deviceKeys.length > 0) {
+          await queue.deleteMany({ deviceId: { $in: deviceKeys } });
+        }
+
+        // 3. Purge collections
+        const devResult = await devices.deleteMany({ homeId: { $in: homeKeys } });
+        devicesDeletedCount += devResult.deletedCount || 0;
+
+        await rooms.deleteMany({ homeId: { $in: homeKeys } });
+        await homes.deleteOne({ _id: home._id });
+        homesDeleted++;
+      }
+
+      // 4. Delete user record permanently
+      if (user) {
+        await users.deleteOne({ _id: user._id });
+      }
+
+      return {
+        userDeleted: !!user,
+        homesDeleted,
+        homesLeft,
+        devicesDeleted: devicesDeletedCount,
+        filesPurged: filesToDelete.length,
+        filesList: filesToDelete
+      };
+    });
+
+    // 🧹 Purge gathered files from Cloudflare R2 asynchronously
+    if (summary.filesList && summary.filesList.length > 0) {
+      c.executionCtx.waitUntil(
+        Promise.allSettled(
+          summary.filesList.map((url) => deleteFileFromR2(url, c.env))
+        )
+      );
+    }
+
+    return c.json({
+      success: true,
+      message: "User account and associated resources deleted successfully.",
+      data: {
+        userDeleted: summary.userDeleted,
+        homesDeleted: summary.homesDeleted,
+        homesLeft: summary.homesLeft,
+        devicesDeleted: summary.devicesDeleted,
+        filesPurged: summary.filesPurged
+      }
+    }, 200);
+
+  } catch (error) {
+    console.error("❌ Delete Account Controller Error:", error);
+    return c.json({
+      success: false,
+      message: "Failed to delete account.",
+      error: error.message
+    }, 500);
+  }
+};
+
+
+
+
+
 export const addMember = async (c) => {
   try {
     const body = await c.req.json().catch(async () => await c.req.parseBody());
