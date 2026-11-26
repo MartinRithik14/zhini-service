@@ -2,6 +2,7 @@ import { withDatabase } from '../utils/config.js';
 import { ObjectId } from "mongodb";
 import { GoogleGenAI } from "@google/genai";
 import { uploadToR2 } from "../services/r2.service.js";
+import { S3Client, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { verifyFirebaseToken } from '../utils/firebase.js';
 import crypto from 'crypto';
 
@@ -1054,21 +1055,34 @@ export const commonDelete = async (c) => {
 };
 
 
-/**
- * Helper to delete a file key from Cloudflare R2 given its public/signed URL
- */
-const deleteFileFromR2 = async (fileUrl, env) => {
+
+// Configure S3 client using your Docker container's environment variables
+const r2Client = new S3Client({
+  region: "auto",
+  endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId: process.env.R2_ACCESS_KEY_ID || "",
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || "",
+  },
+});
+
+const deleteFileFromR2 = async (fileUrl) => {
   try {
     if (!fileUrl || typeof fileUrl !== "string") return;
-    
-    // Extract key path after the domain
-    // Example: https://pub-xxxx.r2.dev/homes/123/product-images/abc.jpg -> homes/123/product-images/abc.jpg
+
+    // Example URL: https://pub-bcd59b3c799e4d68bec4dd8e74a4b91f.r2.dev/homes/123/product-images/abc.jpg
+    // Extracted key: homes/123/product-images/abc.jpg
     const parsedUrl = new URL(fileUrl);
     const key = decodeURIComponent(parsedUrl.pathname.replace(/^\/+/, ""));
-    
-    if (key && env?.MY_BUCKET?.delete) {
-      await env.MY_BUCKET.delete(key);
-    }
+
+    if (!key) return;
+
+    await r2Client.send(
+      new DeleteObjectCommand({
+        Bucket: process.env.R2_BUCKET_NAME || "zhini-prod",
+        Key: key,
+      })
+    );
   } catch (err) {
     console.warn(`⚠️ Failed to remove R2 object (${fileUrl}):`, err.message);
   }
@@ -1108,7 +1122,7 @@ export const deleteAccount = async (c) => {
         `+91${cleanMobile}`,
         ...(user ? [user._id, String(user._id)] : [])
       ];
-      
+
       const isMe = (m) => memberRefs.some((r) => String(r) === String(m));
 
       // Find all homes where this user is a member or owner
@@ -1131,7 +1145,7 @@ export const deleteAccount = async (c) => {
           ...(home.members || []),
           ...(home.memberIds || [])
         ];
-        
+
         const otherMembers = allMembers.filter((m) => !isMe(m));
 
         // 👨‍👩‍👧‍👦 Scenario A: Home has other members -> Just remove the user
@@ -1149,7 +1163,7 @@ export const deleteAccount = async (c) => {
           continue;
         }
 
-        // 💥 Scenario B: Solo owner/member -> Aggressively wipe the entire home tree
+        // 💥 Scenario B: Solo owner/member -> Wipe the entire home tree
         const homeKeys = [
           home._id,
           String(home._id),
@@ -1203,12 +1217,23 @@ export const deleteAccount = async (c) => {
     });
 
     // 🧹 Purge gathered files from Cloudflare R2 asynchronously
+    // Compatible with both Node.js (fire-and-forget) and Cloudflare Workers (executionCtx)
     if (summary.filesList && summary.filesList.length > 0) {
-      c.executionCtx.waitUntil(
-        Promise.allSettled(
-          summary.filesList.map((url) => deleteFileFromR2(url, c.env))
-        )
-      );
+      const purgePromise = Promise.allSettled(
+        summary.filesList.map((url) => deleteFileFromR2(url))
+      ).then((results) => {
+        const failed = results.filter((r) => r.status === "rejected").length;
+        if (failed > 0) console.warn(`⚠️ ${failed} R2 file(s) failed deletion.`);
+      });
+
+      // If running inside Cloudflare Workers, use executionCtx; otherwise Node.js handles the background promise
+      try {
+        if (c.executionCtx && typeof c.executionCtx.waitUntil === "function") {
+          c.executionCtx.waitUntil(purgePromise);
+        }
+      } catch (_) {
+        // Node.js fallback: unhandled rejection caught in promise chain
+      }
     }
 
     return c.json({
@@ -1232,8 +1257,6 @@ export const deleteAccount = async (c) => {
     }, 500);
   }
 };
-
-
 
 
 
