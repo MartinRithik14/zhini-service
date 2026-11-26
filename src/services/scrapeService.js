@@ -103,59 +103,77 @@ export const scrapeServiceCenters = async (
 };
 
 
-export const scrapeHomeServices = async (serviceType, { pincode, lat, lng } = {}) => {
+export const scrapeHomeServices = async (
+  serviceType,
+  coordinates, // { lat: number, lng: number } - Strictly required
+  options = { maxDistanceKm: 30 }
+) => {
   try {
-    const hasCoordinates = lat !== null && lng !== null && !isNaN(lat) && !isNaN(lng);
+    const cleanService = (serviceType || '').trim();
+    const queryTerm = `${cleanService} service repair`;
 
-    // Construct payload for Google Places API (New)
-    const requestBody = {
-      textQuery: hasCoordinates 
-        ? `${serviceType} services` 
-        : `${serviceType} services in ${pincode}`
-    };
+    const maxDistance = options.maxDistanceKm || 30;
+    const radiusMeters = maxDistance * 1000.0;
 
-    // If coordinates exist, bias results within a 15km radius of the user
-    if (hasCoordinates) {
-      requestBody.locationBias = {
+    const requestPayload = {
+      textQuery: queryTerm,
+      locationBias: {
         circle: {
           center: {
-            latitude: Number(lat),
-            longitude: Number(lng)
+            latitude: coordinates.lat,
+            longitude: coordinates.lng,
           },
-          radius: 15000.0 // 15 km radius
-        }
-      };
-    }
+          radius: radiusMeters, // Dynamic bias matching maxDistanceKm
+        },
+      },
+    };
 
     const response = await axios.post(
-      "https://places.googleapis.com/v1/places:searchText",
-      requestBody,
+      'https://places.googleapis.com/v1/places:searchText',
+      requestPayload,
       {
         headers: {
-          "Content-Type": "application/json",
-          "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-          "X-Goog-FieldMask":
-            "places.displayName,places.nationalPhoneNumber,places.formattedAddress,places.rating",
+          'Content-Type': 'application/json',
+          'X-Goog-Api-Key': GOOGLE_PLACES_API_KEY,
+          'X-Goog-FieldMask':
+            'places.displayName,places.nationalPhoneNumber,places.formattedAddress,places.rating,places.location',
         },
       }
     );
 
     const places = response.data.places || [];
 
-    const normalizedData = places.map((place) => ({
-      name: place.displayName?.text || `${serviceType} Services`,
-      phone: place.nationalPhoneNumber || "N/A",
-      address: place.formattedAddress || "Address not available",
-      rating: place.rating ? place.rating.toString() : "N/A",
-      type: serviceType
-    }));
+    let normalizedData = places.map((place) => {
+      const placeLat = place.location?.latitude ?? null;
+      const placeLng = place.location?.longitude ?? null;
 
-    return normalizedData;
+      let distanceKm = null;
+      if (placeLat !== null && placeLng !== null) {
+        distanceKm = parseFloat(
+          calculateDistanceKm(coordinates.lat, coordinates.lng, placeLat, placeLng).toFixed(2)
+        );
+      }
+
+      return {
+        name: place.displayName?.text || `${cleanService} Service Professional`,
+        phone: place.nationalPhoneNumber || 'N/A',
+        address: place.formattedAddress || 'Address not available',
+        rating: place.rating ? place.rating.toString() : 'N/A',
+        distanceKm,
+        location: place.location || null,
+      };
+    });
+
+    // Filter within operational radius and sort by nearest first
+    return normalizedData
+      .filter((p) => p.distanceKm !== null && p.distanceKm <= maxDistance)
+      .sort((a, b) => a.distanceKm - b.distanceKm);
+
   } catch (error) {
     console.error(
-      "Google Places API Error (Home Services):",
+      'Google Places API Error (Home Services):',
       error.response?.data || error.message
     );
-    throw new Error("Failed to fetch nearby home services.");
+    throw new Error('Failed to fetch home services from Google Places API.');
   }
 };

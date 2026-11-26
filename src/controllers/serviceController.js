@@ -362,33 +362,34 @@ export const getNearbyService = async (c) => {
 
 export const getNearbyHomeServices = async (c) => {
   try {
-    // Read directly from body (with fallback for raw json or query)
     let body = {};
     try {
       body = await c.req.json();
     } catch (_) {
-      body = await c.req.parseBody();
+      body = await c.req.parseBody().catch(() => ({}));
     }
 
     const serviceType = (body.serviceType || body.category || c.req.query('serviceType') || '').trim();
-    const pincode = (body.pincode || c.req.query('pincode') || '').trim();
-    const rawLat = body.latitude || body.lat || c.req.query('latitude') || c.req.query('lat') || null;
-    const rawLng = body.longitude || body.lng || c.req.query('longitude') || c.req.query('lng') || null;
+
+    const rawLat = body.latitude ?? body.lat ?? c.req.query('latitude') ?? c.req.query('lat') ?? null;
+    const rawLng = body.longitude ?? body.lng ?? c.req.query('longitude') ?? c.req.query('lng') ?? null;
 
     const lat = rawLat !== null && !isNaN(Number(rawLat)) ? Number(rawLat) : null;
     const lng = rawLng !== null && !isNaN(Number(rawLng)) ? Number(rawLng) : null;
     const hasCoordinates = lat !== null && lng !== null;
 
-    if (!serviceType || (!pincode && !hasCoordinates)) {
+    if (!serviceType || !hasCoordinates) {
       return c.json({
         success: false,
-        message: 'serviceType and at least one location parameter (pincode or latitude/longitude) are required.'
+        message: 'serviceType and valid coordinates (latitude and longitude) are required.'
       }, 400);
     }
 
-    // Generate unique cache key based on available location identifier
-    const locationKey = hasCoordinates ? `${lat.toFixed(4)}_${lng.toFixed(4)}` : pincode;
-    const cacheKey = `home_service_${serviceType}_${locationKey}`.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const userCoords = { lat, lng };
+
+    // Group by ~1.1 km area grid for caching
+    const coordCacheSlug = `${lat.toFixed(2)}_${lng.toFixed(2)}`;
+    const cacheKey = `home_service_${serviceType}_${coordCacheSlug}`.toLowerCase().replace(/[^a-z0-9]/g, '');
 
     const servicesData = await withDatabase(mongoUri, async (db) => {
       const collection = db.collection('common_cache');
@@ -400,13 +401,11 @@ export const getNearbyHomeServices = async (c) => {
         return cached.data;
       }
 
-      // 2. Fetch live local technicians
-      console.log(`🌐 Fetching live local services for "${serviceType}" at (${locationKey})...`);
-      const freshData = await scrapeHomeServices(serviceType, { pincode, lat, lng });
+      // 2. Fetch live local technicians using coordinates
+      console.log(`🌐 Fetching live local services for "${serviceType}" at (${lat}, ${lng})...`);
+      const freshData = await scrapeHomeServices(serviceType, userCoords, { maxDistanceKm: 30 });
 
-      const topServices = freshData
-        .sort((a, b) => (parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0))
-        .slice(0, 20);
+      const topServices = freshData.slice(0, 20);
 
       if (topServices.length > 0) {
         await collection.updateOne(
