@@ -107,8 +107,8 @@ export const getNearbyService = async (c) => {
     const rawProduct = body.product || c.req.query('product') || '';
     const rawPincode = body.pincode || c.req.query('pincode') || '';
 
-    const rawLat = body.latitude || body.lat || c.req.query('latitude') || c.req.query('lat') || null;
-    const rawLng = body.longitude || body.lng || c.req.query('longitude') || c.req.query('lng') || null;
+    const rawLat = body.latitude ?? body.lat ?? c.req.query('latitude') ?? c.req.query('lat') ?? null;
+    const rawLng = body.longitude ?? body.lng ?? c.req.query('longitude') ?? c.req.query('lng') ?? null;
 
     const lat = rawLat !== null ? parseFloat(rawLat) : null;
     const lng = rawLng !== null ? parseFloat(rawLng) : null;
@@ -132,33 +132,30 @@ export const getNearbyService = async (c) => {
     const pincode = cleanValue(rawPincode);
 
     const hasCoordinates = lat !== null && !isNaN(lat) && lng !== null && !isNaN(lng);
-    const hasLocation = pincode || hasCoordinates;
 
-    if (!hasLocation || (!brand && !product)) {
-      console.warn(`⚠️ Validation Failed [400]: brand="${rawBrand}", product="${rawProduct}", pincode="${rawPincode}", lat="${rawLat}", lng="${rawLng}"`);
+    // Latitude & Longitude are strictly required for spatial mapping
+    if (!hasCoordinates || (!brand && !product)) {
+      console.warn(`⚠️ Validation Failed [400]: brand="${rawBrand}", product="${rawProduct}", lat="${rawLat}", lng="${rawLng}"`);
       return c.json({
         success: false,
-        message: 'A valid location (pincode or latitude/longitude) and at least one search term (brand or product) are required'
+        message: 'Accurate coordinates (latitude and longitude) and at least one search term (brand or product) are required.'
       }, 400);
     }
+
+    const userCoords = { lat, lng };
 
     const response = await withDatabase(mongoUri, async (db) => {
       const cacheCollection = db.collection('service_cache');
 
-      // Resolve effective coordinates (Mobile GPS or Geocoded Pincode)
-      let effectiveCoords = hasCoordinates ? { lat, lng } : null;
-      if (!effectiveCoords && pincode) {
-        effectiveCoords = await getCoordinatesFromPincode(pincode, db);
-      }
-
-      const locationQuery = pincode || (effectiveCoords ? `${effectiveCoords.lat.toFixed(4)},${effectiveCoords.lng.toFixed(4)}` : '');
+      // Grid-level coordinate caching (~1.1 km area per cell)
+      const coordCacheSlug = `${lat.toFixed(2)}_${lng.toFixed(2)}`;
 
       // -------------------------------------------------------------
-      // TIER 1: ACTIVE WARRANTY -> Authorized Service Centers Only
+      // TIER 1: ACTIVE WARRANTY -> Google Places (Strictly Lat / Lng)
       // -------------------------------------------------------------
       if (isUnderWarranty) {
-        console.log(`🛡️ Tier 1 Triggered: Searching Authorized Centers for ${brand} ${product} near ${locationQuery}`);
-        const cacheKey = `tier1_${brand}_${product}_${locationQuery}`.toLowerCase().replace(/[^a-z0-9]/g, '');
+        console.log(`🛡️ Tier 1 Triggered: Searching Authorized Centers for ${brand} ${product} near (${lat}, ${lng})`);
+        const cacheKey = `tier1_${brand}_${product}_${coordCacheSlug}`.toLowerCase().replace(/[^a-z0-9]/g, '');
 
         const cached = await cacheCollection.findOne({ key: cacheKey });
         if (cached && (Date.now() - cached.timestamp) < CACHE_EXPIRATION_MS) {
@@ -166,13 +163,10 @@ export const getNearbyService = async (c) => {
           return { tier: 1, tierName: 'Brand Authorized', data: cached.data };
         }
 
-        const centers = await scrapeServiceCenters(
-          brand,
-          product,
-          locationQuery,
-          effectiveCoords,
-          { authorizedOnly: true, maxDistanceKm: 75 }
-        );
+        const centers = await scrapeServiceCenters(brand, product, userCoords, {
+          authorizedOnly: true,
+          maxDistanceKm: 75
+        });
 
         if (centers.length > 0) {
           await cacheCollection.updateOne(
@@ -186,29 +180,27 @@ export const getNearbyService = async (c) => {
       }
 
       // -------------------------------------------------------------
-      // TIER 2: OUT OF WARRANTY -> Zhini Providers (Tags + Wekan Trust Ranking)
+      // TIER 2: OUT OF WARRANTY -> Zhini Providers (Pincode & Distance)
       // -------------------------------------------------------------
-      console.log(`🔍 Checking Tier 2: Zhini Local Providers for "${product || brand}" near location="${locationQuery}"`);
+      console.log(`🔍 Checking Tier 2: Zhini Local Providers for "${product || brand}" [Pincode: ${pincode || 'None'}]`);
 
       try {
         const providerCollection = db.collection('service-providers');
         const wekanCollection = db.collection('wekan-service');
 
-        // Normalize requested product/brand into search slugs
         const targetProductTag = normalizeTag(product);
         const targetBrandTag = normalizeTag(brand);
 
         // 1. Fetch active providers
         const activeProviders = await providerCollection.find({ status: 'active' }).toArray();
 
-        // 2. Filter providers by Expertise Tag match & Geographical Distance
+        // 2. Filter providers by expertise tag and spatial distance
         const matchingProviders = activeProviders
           .map((provider) => {
             const providerTags = Array.isArray(provider.expertise)
               ? provider.expertise.map(normalizeTag)
               : [];
 
-            // Tag match: tag slug includes query slug or vice-versa (e.g. "laptop" matches "laptop" or "laptop_repair")
             const isMatch = providerTags.some((tag) => {
               if (targetProductTag && (tag.includes(targetProductTag) || targetProductTag.includes(tag))) {
                 return true;
@@ -221,17 +213,17 @@ export const getNearbyService = async (c) => {
 
             if (!isMatch) return null;
 
-            // Distance calculation & radius cutoff
+            // Distance calculation against provider coordinates
             let distanceKm = null;
-            if (effectiveCoords && provider.location?.coordinates) {
+            if (provider.location?.coordinates) {
               const [pLng, pLat] = provider.location.coordinates;
               distanceKm = parseFloat(
-                calculateDistanceKm(effectiveCoords.lat, effectiveCoords.lng, pLat, pLng).toFixed(2)
+                calculateDistanceKm(lat, lng, pLat, pLng).toFixed(2)
               );
               const maxRadius = Number(provider.serviceRadiusKm) || 10;
-              if (distanceKm > maxRadius) return null; // Outside provider's operational zone
+              if (distanceKm > maxRadius) return null; // Outside provider operational zone
             } else if (pincode && provider.pincode !== pincode) {
-              // Direct pincode fallback if geocoding coordinates are missing
+              // Fallback match by postal code if provider lacks coordinates
               return null;
             }
 
@@ -244,7 +236,7 @@ export const getNearbyService = async (c) => {
 
         // 3. If matching providers exist, apply Wekan Social Proof & History Ranking
         if (matchingProviders.length > 0) {
-          // A. User Past Service History
+          // A. User Personal Service History
           let userPastMobiles = new Set();
           if (cleanCustomerPhone) {
             const customerTickets = await wekanCollection.find({
@@ -258,10 +250,9 @@ export const getNearbyService = async (c) => {
             });
           }
 
-          // B. Neighbor Service History (Tickets in the customer's pincode area)
+          // B. Neighbor Service History (Strictly using Pincode for neighborhood ticket aggregation)
           let neighborCountMap = {};
           if (pincode) {
-            // Match pincode inside customerDetails.address
             const neighborTickets = await wekanCollection.find({
               'customerDetails.address': { $regex: pincode }
             }).toArray();
@@ -296,21 +287,18 @@ export const getNearbyService = async (c) => {
             };
           });
 
-          // D. Multi-Factor Sort: Past Provider > Neighbor Trust > Distance (Ascending)
+          // D. Multi-Factor Sort: Past Provider > Neighbor Service Trust > Distance (Ascending)
           rankedProviders.sort((a, b) => {
-            // 1. Personal past relationship comes first
             if (a.hasUsedBefore !== b.hasUsedBefore) {
               return b.hasUsedBefore ? 1 : -1;
             }
-            // 2. Neighbor service volume (social proof)
             if (b.neighborServiceCount !== a.neighborServiceCount) {
               return b.neighborServiceCount - a.neighborServiceCount;
             }
-            // 3. Proximity
             return (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity);
           });
 
-          console.log(`🎯 Tier 2 Hit: Found ${rankedProviders.length} Zhini Service Provider(s) ranked by history & proximity`);
+          console.log(`🎯 Tier 2 Hit: Found ${rankedProviders.length} Zhini Partner(s) ranked by history & proximity`);
 
           return {
             tier: 2,
@@ -323,10 +311,10 @@ export const getNearbyService = async (c) => {
       }
 
       // -------------------------------------------------------------
-      // TIER 3 (Fallback): OUT OF WARRANTY + NO LOCAL ZHINI PARTNER -> Google Places
+      // TIER 3 (Fallback): OUT OF WARRANTY + NO LOCAL ZHINI PARTNER -> Google Places (Strictly Lat / Lng)
       // -------------------------------------------------------------
-      console.log(`🏢 Tier 3 Fallback Triggered: Fetching local centers for ${brand || product} in ${locationQuery}`);
-      const cacheKeyTier3 = `tier3_${brand}_${product}_${locationQuery}`.toLowerCase().replace(/[^a-z0-9]/g, '');
+      console.log(`🏢 Tier 3 Fallback Triggered: Fetching local centers for ${brand || product} near (${lat}, ${lng})`);
+      const cacheKeyTier3 = `tier3_${brand}_${product}_${coordCacheSlug}`.toLowerCase().replace(/[^a-z0-9]/g, '');
 
       const cachedTier3 = await cacheCollection.findOne({ key: cacheKeyTier3 });
       if (cachedTier3 && (Date.now() - cachedTier3.timestamp) < CACHE_EXPIRATION_MS) {
@@ -334,22 +322,12 @@ export const getNearbyService = async (c) => {
         return { tier: 3, tierName: 'General Top Rated', data: cachedTier3.data };
       }
 
-      const rawCenters = await scrapeServiceCenters(
-        brand,
-        product,
-        locationQuery,
-        effectiveCoords,
-        { authorizedOnly: false, maxDistanceKm: 75 }
-      );
+      const rawCenters = await scrapeServiceCenters(brand, product, userCoords, {
+        authorizedOnly: false,
+        maxDistanceKm: 75
+      });
 
-      let sortedCenters = rawCenters;
-      if (!effectiveCoords) {
-        sortedCenters = rawCenters.sort(
-          (a, b) => (parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0)
-        );
-      }
-
-      const finalCenters = sortedCenters.slice(0, 20);
+      const finalCenters = rawCenters.slice(0, 20);
 
       if (finalCenters.length > 0) {
         await cacheCollection.updateOne(

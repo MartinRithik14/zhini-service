@@ -20,61 +20,40 @@ const calculateDistanceKm = (lat1, lon1, lat2, lon2) => {
 export const scrapeServiceCenters = async (
   brand,
   product,
-  locationQuery,
-  coordinates = null, // { lat, lng }
+  coordinates, // { lat: number, lng: number } - Strictly required
   options = { authorizedOnly: false, maxDistanceKm: 75 }
 ) => {
   try {
-    const hasBrand = brand && brand.trim() && brand.toUpperCase() !== "N/A";
-    const cleanBrand = hasBrand ? brand.trim() : "";
-    const cleanProduct = product ? product.trim() : "";
+    const hasBrand = brand && brand.trim() && brand.toUpperCase() !== 'N/A';
+    const cleanBrand = hasBrand ? brand.trim() : '';
+    const cleanProduct = product ? product.trim() : '';
 
-    let queryTerm = "";
-    if (options.authorizedOnly) {
-      queryTerm = hasBrand 
-        ? `${cleanBrand} ${cleanProduct} authorized service center` 
-        : `${cleanProduct} authorized service center`;
-    } else {
-      queryTerm = hasBrand 
-        ? `${cleanBrand} ${cleanProduct} repair service center` 
-        : `${cleanProduct} repair service center`;
-    }
+    const suffix = options.authorizedOnly ? 'authorized service center' : 'repair service center';
+    const queryTerm = [cleanBrand, cleanProduct, suffix].filter(Boolean).join(' ');
 
+    // 1. Text Query is clean (no location strings attached)
     const requestPayload = {
-      textQuery: (coordinates && coordinates.lat && coordinates.lng) 
-        ? queryTerm 
-        : `${queryTerm} near ${locationQuery}`,
+      textQuery: queryTerm,
+      locationBias: {
+        circle: {
+          center: {
+            latitude: coordinates.lat,
+            longitude: coordinates.lng,
+          },
+          radius: 50000.0, // 50 km circular spatial bias around pin
+        },
+      },
     };
 
-    if (coordinates && coordinates.lat !== null && coordinates.lng !== null) {
-      // Define a ~55 km bounding box rectangle for Google Places API (New)
-      const delta = 0.5; // ~55 km in each direction
-
-      requestPayload.locationRestriction = {
-        rectangle: {
-          low: {
-            latitude: coordinates.lat - delta,
-            longitude: coordinates.lng - delta,
-          },
-          high: {
-            latitude: coordinates.lat + delta,
-            longitude: coordinates.lng + delta,
-          },
-        },
-      };
-
-      requestPayload.rankPreference = "DISTANCE";
-    }
-
     const response = await axios.post(
-      "https://places.googleapis.com/v1/places:searchText",
+      'https://places.googleapis.com/v1/places:searchText',
       requestPayload,
       {
         headers: {
-          "Content-Type": "application/json",
-          "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-          "X-Goog-FieldMask":
-            "places.displayName,places.nationalPhoneNumber,places.formattedAddress,places.rating,places.location",
+          'Content-Type': 'application/json',
+          'X-Goog-Api-Key': GOOGLE_PLACES_API_KEY,
+          'X-Goog-FieldMask':
+            'places.displayName,places.nationalPhoneNumber,places.formattedAddress,places.rating,places.location',
         },
       }
     );
@@ -85,12 +64,13 @@ export const scrapeServiceCenters = async (
       ? `${cleanBrand || cleanProduct} Authorized Service Center`
       : `${cleanProduct || cleanBrand} Repair Center`;
 
+    // 2. Measure true Haversine distance from target pin to each place
     let normalizedData = places.map((place) => {
       const placeLat = place.location?.latitude ?? null;
       const placeLng = place.location?.longitude ?? null;
 
       let distanceKm = null;
-      if (coordinates && coordinates.lat !== null && coordinates.lng !== null && placeLat !== null && placeLng !== null) {
+      if (placeLat !== null && placeLng !== null) {
         distanceKm = parseFloat(
           calculateDistanceKm(coordinates.lat, coordinates.lng, placeLat, placeLng).toFixed(2)
         );
@@ -98,30 +78,27 @@ export const scrapeServiceCenters = async (
 
       return {
         name: place.displayName?.text || fallbackName,
-        phone: place.nationalPhoneNumber || "N/A",
-        address: place.formattedAddress || "Address not available",
-        rating: place.rating ? place.rating.toString() : "N/A",
+        phone: place.nationalPhoneNumber || 'N/A',
+        address: place.formattedAddress || 'Address not available',
+        rating: place.rating ? place.rating.toString() : 'N/A',
         distanceKm,
         location: place.location || null,
       };
     });
 
-    // Final gatekeeper: drop anything outside maxDistanceKm and sort nearest first
-    if (coordinates && coordinates.lat !== null && coordinates.lng !== null) {
-      const maxDistance = options.maxDistanceKm || 75;
+    // 3. Drop anything beyond max cutoff and enforce strict nearest-first ordering
+    const maxDistance = options.maxDistanceKm || 75;
 
-      normalizedData = normalizedData
-        .filter((p) => p.distanceKm !== null && p.distanceKm <= maxDistance)
-        .sort((a, b) => a.distanceKm - b.distanceKm);
-    }
+    return normalizedData
+      .filter((p) => p.distanceKm !== null && p.distanceKm <= maxDistance)
+      .sort((a, b) => a.distanceKm - b.distanceKm);
 
-    return normalizedData;
   } catch (error) {
     console.error(
-      "Google Places API Error:",
+      'Google Places API Error:',
       error.response?.data || error.message
     );
-    throw new Error("Failed to fetch service centers from Google Places API.");
+    throw new Error('Failed to fetch service centers from Google Places API.');
   }
 };
 
