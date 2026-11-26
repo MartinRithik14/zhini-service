@@ -216,7 +216,21 @@ export const createHome = async (c) => {
     const headerDeviceId = c.req.header("x-device-id");
 
     const body = await c.req.json().catch(async () => await c.req.parseBody());
-    const { name, mobile, address, pincode, homeName, UserInfo, PlatformInfo, AppInfo } = body;
+    const {
+      name,
+      mobile,
+      address,
+      pincode,
+      homeName,
+      latitude,
+      longitude,
+      lat,
+      lng,
+      location,
+      UserInfo,
+      PlatformInfo,
+      AppInfo
+    } = body;
 
     const rawMobile = mobile || UserInfo?.phoneNo || UserInfo?.mobile;
     const incomingDevice = PlatformInfo?.devices?.[0] || PlatformInfo?.device;
@@ -251,6 +265,24 @@ export const createHome = async (c) => {
     const cleanAddress = (address || "").toString().trim();
     const cleanPincode = (pincode || "").toString().trim();
     const numMobile = Number(cleanMobile);
+
+    // Coordinate Parsing (GeoJSON standard: [longitude, latitude])
+    const rawLatitude = latitude ?? lat ?? location?.coordinates?.[1] ?? location?.lat;
+    const rawLongitude = longitude ?? lng ?? location?.coordinates?.[0] ?? location?.lng;
+
+    const parsedLat = rawLatitude !== undefined && rawLatitude !== null ? parseFloat(rawLatitude) : null;
+    const parsedLng = rawLongitude !== undefined && rawLongitude !== null ? parseFloat(rawLongitude) : null;
+
+    const hasValidCoords =
+      parsedLat !== null && !isNaN(parsedLat) &&
+      parsedLng !== null && !isNaN(parsedLng);
+
+    const locationData = hasValidCoords
+      ? {
+          type: "Point",
+          coordinates: [parsedLng, parsedLat]
+        }
+      : null;
 
     const result = await withDatabase(process.env.MONGODB_URI, async (db) => {
       const usersCol = db.collection("users");
@@ -350,15 +382,32 @@ export const createHome = async (c) => {
       }
 
       if (existingHome) {
+        // If existing home is missing coordinates but mobile provided them now, update the record
+        if (hasValidCoords && (!existingHome.location || !existingHome.latitude)) {
+          await homesCol.updateOne(
+            { _id: existingHome._id },
+            {
+              $set: {
+                location: locationData,
+                latitude: parsedLat,
+                longitude: parsedLng,
+                updatedAt: now
+              }
+            }
+          );
+        }
         return { homeId: existingHome._id.toString(), reused: true, userId };
       }
 
-      // 8. Create Home
+      // 8. Create Home with Coordinates
       const homeInsert = await homesCol.insertOne({
         ownerId: userId,
         homeName: cleanHomeName,
         address: cleanAddress,
         pincode: cleanPincode,
+        location: locationData,
+        latitude: hasValidCoords ? parsedLat : null,
+        longitude: hasValidCoords ? parsedLng : null,
         members: [userId],
         memberIds: [userId],
         createdAt: now,
@@ -382,6 +431,297 @@ export const createHome = async (c) => {
     return c.json({ success: false, message: "Internal Server Error", error: error.message }, 500);
   }
 };
+
+export const updateEntity = async (c) => {
+  try {
+    // 🛡️ 1. Enforce authenticated session context
+    const currentUser = c.get("user");
+    if (!currentUser) {
+      return c.json({ success: false, message: "Unauthorized: Active session required." }, 401);
+    }
+    const currentUserId = currentUser._id;
+
+    // 🛡️ Safe body parsing based on Content-Type header
+    const contentType = c.req.header("content-type") || "";
+    let body = {};
+
+    if (contentType.includes("application/json")) {
+      body = await c.req.json().catch(() => ({}));
+    } else if (
+      contentType.includes("multipart/form-data") ||
+      contentType.includes("application/x-www-form-urlencoded")
+    ) {
+      body = await c.req.parseBody({ all: true }).catch(() => ({}));
+    } else {
+      body = await c.req.json().catch(async () => await c.req.parseBody({ all: true }).catch(() => ({})));
+    }
+
+    const {
+      homeId,
+      homeName,
+      address,
+      pincode,
+      latitude,
+      longitude,
+      lat,
+      lng,
+      location,
+      name,
+      mobile,
+      roomId,
+      roomName,
+      deviceId,
+      product,
+      brand,
+      warranty,
+      notificationsEnabled,
+      modelNumber,
+      serialNumber,
+      purchasedShopName,
+      shopWarranty
+    } = body;
+
+    // 2. Validate mandatory root anchor
+    if (!homeId) {
+      return c.json({
+        success: false,
+        message: "Missing required field: homeId is required to update details."
+      }, 400);
+    }
+
+    if (!ObjectId.isValid(homeId)) {
+      return c.json({
+        success: false,
+        message: "Invalid homeId format provided."
+      }, 400);
+    }
+
+    const cleanHomeIdStr = homeId.toString().trim();
+    const targetHomeId = new ObjectId(cleanHomeIdStr);
+
+    const result = await withDatabase(process.env.MONGODB_URI, async (db) => {
+      const homesCol = db.collection("homes");
+      const usersCol = db.collection("users");
+      const roomsCol = db.collection("rooms");
+      const devicesCol = db.collection("devices");
+
+      // 3. Verify Home exists AND ensure current user is an owner or member
+      const homeDoc = await homesCol.findOne({
+        _id: targetHomeId,
+        $or: [
+          { ownerId: currentUserId },
+          { members: currentUserId },
+          { memberIds: currentUserId }
+        ]
+      });
+
+      if (!homeDoc) {
+        throw new Error("HOME_FORBIDDEN_OR_NOT_FOUND");
+      }
+
+      const updatedSummary = {
+        homeUpdated: false,
+        userUpdated: false,
+        roomUpdated: false,
+        roomCreated: false,
+        createdRoomId: null,
+        deviceUpdated: false
+      };
+
+      const now = new Date().toISOString();
+
+      // 4. Update Home Details (including Latitude & Longitude)
+      const rawLatitude = latitude ?? lat ?? location?.coordinates?.[1] ?? location?.lat;
+      const rawLongitude = longitude ?? lng ?? location?.coordinates?.[0] ?? location?.lng;
+
+      const hasCoordUpdate = rawLatitude !== undefined || rawLongitude !== undefined;
+
+      if (
+        homeName !== undefined ||
+        address !== undefined ||
+        pincode !== undefined ||
+        hasCoordUpdate
+      ) {
+        const homeUpdates = { updatedAt: now };
+
+        if (homeName !== undefined) homeUpdates.homeName = homeName.toString().trim();
+        if (address !== undefined) homeUpdates.address = address.toString().trim();
+        if (pincode !== undefined) homeUpdates.pincode = pincode.toString().trim();
+
+        if (hasCoordUpdate) {
+          const parsedLat = rawLatitude !== null && rawLatitude !== undefined ? parseFloat(rawLatitude) : null;
+          const parsedLng = rawLongitude !== null && rawLongitude !== undefined ? parseFloat(rawLongitude) : null;
+
+          if (parsedLat !== null && !isNaN(parsedLat) && parsedLng !== null && !isNaN(parsedLng)) {
+            homeUpdates.location = {
+              type: "Point",
+              coordinates: [parsedLng, parsedLat]
+            };
+            homeUpdates.latitude = parsedLat;
+            homeUpdates.longitude = parsedLng;
+          }
+        }
+
+        const homeRes = await homesCol.updateOne(
+          { _id: targetHomeId },
+          { $set: homeUpdates }
+        );
+        updatedSummary.homeUpdated = homeRes.modifiedCount > 0;
+      }
+
+      // 5. Update User Profile Details (for the authenticated user)
+      if (name !== undefined || mobile !== undefined) {
+        const userUpdates = { updatedAt: now };
+
+        if (name !== undefined) {
+          const cleanName = name.toString().trim();
+          userUpdates.name = cleanName;
+          userUpdates["UserInfo.name"] = cleanName;
+        }
+
+        if (mobile !== undefined) {
+          const cleanMobile = mobile.toString().trim();
+          userUpdates.mobile = cleanMobile;
+          userUpdates["UserInfo.phoneNo"] = cleanMobile;
+        }
+
+        const userQuery = ObjectId.isValid(currentUserId)
+          ? { _id: new ObjectId(currentUserId) }
+          : { _id: currentUserId };
+
+        const userRes = await usersCol.updateOne(
+          userQuery,
+          { $set: userUpdates }
+        );
+        updatedSummary.userUpdated = userRes.modifiedCount > 0;
+      }
+
+      // 6. Room Management: Update existing OR Add new Room
+      if (roomName) {
+        const cleanRoomName = roomName.toString().trim();
+        let existingRoom = null;
+
+        if (roomId && ObjectId.isValid(roomId)) {
+          existingRoom = await roomsCol.findOne({
+            _id: new ObjectId(roomId.toString().trim()),
+            $or: [{ homeId: targetHomeId }, { homeId: cleanHomeIdStr }]
+          });
+        } else {
+          const escapedName = cleanRoomName.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&");
+          existingRoom = await roomsCol.findOne({
+            $or: [{ homeId: targetHomeId }, { homeId: cleanHomeIdStr }],
+            roomName: { $regex: new RegExp(`^${escapedName}$`, "i") }
+          });
+        }
+
+        if (existingRoom) {
+          const roomRes = await roomsCol.updateOne(
+            { _id: existingRoom._id },
+            { $set: { roomName: cleanRoomName, updatedAt: now } }
+          );
+          updatedSummary.roomUpdated = roomRes.modifiedCount > 0;
+        } else {
+          const insertRoomRes = await roomsCol.insertOne({
+            homeId: targetHomeId,
+            roomName: cleanRoomName,
+            createdAt: now,
+            updatedAt: now
+          });
+          updatedSummary.roomCreated = true;
+          updatedSummary.createdRoomId = insertRoomRes.insertedId.toString();
+        }
+      }
+
+      // 7. Update Device Details
+      if (
+        deviceId &&
+        (product !== undefined ||
+          brand !== undefined ||
+          warranty !== undefined ||
+          notificationsEnabled !== undefined ||
+          modelNumber !== undefined ||
+          serialNumber !== undefined ||
+          purchasedShopName !== undefined ||
+          shopWarranty !== undefined)
+      ) {
+        const deviceUpdates = { updatedAt: now };
+        if (product !== undefined) deviceUpdates.product = product ? product.toString().trim() : null;
+        if (brand !== undefined) deviceUpdates.brand = brand ? brand.toString().trim() : null;
+
+        if (warranty !== undefined) {
+          deviceUpdates.warranty = warranty;
+          deviceUpdates.notifiedMilestones = [];
+        }
+
+        if (notificationsEnabled !== undefined) {
+          deviceUpdates.notificationsEnabled =
+            typeof notificationsEnabled === "boolean"
+              ? notificationsEnabled
+              : String(notificationsEnabled).trim().toLowerCase() === "true";
+        }
+
+        if (modelNumber !== undefined) {
+          deviceUpdates.modelNumber = modelNumber ? modelNumber.toString().trim() : null;
+        }
+        if (serialNumber !== undefined) {
+          deviceUpdates.serialNumber = serialNumber ? serialNumber.toString().trim() : null;
+        }
+        if (purchasedShopName !== undefined) {
+          deviceUpdates.purchasedShopName = purchasedShopName ? purchasedShopName.toString().trim() : null;
+        }
+        if (shopWarranty !== undefined) {
+          deviceUpdates.shopWarranty = shopWarranty ? shopWarranty.toString().trim() : null;
+        }
+
+        const cleanDeviceIdStr = deviceId.toString().trim();
+
+        const deviceFilter = {
+          $and: [
+            {
+              $or: [
+                { deviceId: cleanDeviceIdStr },
+                ...(ObjectId.isValid(cleanDeviceIdStr) ? [{ _id: new ObjectId(cleanDeviceIdStr) }] : [])
+              ]
+            },
+            {
+              $or: [
+                { homeId: targetHomeId },
+                { homeId: cleanHomeIdStr }
+              ]
+            }
+          ]
+        };
+
+        const deviceRes = await devicesCol.updateOne(
+          deviceFilter,
+          { $set: deviceUpdates }
+        );
+        updatedSummary.deviceUpdated = deviceRes.modifiedCount > 0;
+      }
+
+      return updatedSummary;
+    });
+
+    return c.json({
+      success: true,
+      message: "Entities updated successfully across collections.",
+      data: result
+    }, 200);
+
+  } catch (error) {
+    console.error("❌ Update Entity Controller Error:", error);
+
+    if (error.message === "HOME_FORBIDDEN_OR_NOT_FOUND") {
+      return c.json({
+        success: false,
+        message: "Home record not found or you do not have permission to modify it."
+      }, 403);
+    }
+
+    return c.json({ success: false, message: "Internal Server Error", error: error.message }, 500);
+  }
+};
+
 
 export const createProductSubmission = async (c) => {
   try {
@@ -570,269 +910,6 @@ export const createProductSubmission = async (c) => {
 
     if (error.message === "HOME_NOT_FOUND") {
       return c.json({ success: false, message: "No home record found with the provided homeId." }, 404);
-    }
-
-    return c.json({ success: false, message: "Internal Server Error", error: error.message }, 500);
-  }
-};
-
-export const updateEntity = async (c) => {
-  try {
-    // 🛡️ 1. Enforce authenticated session context
-    const currentUser = c.get("user");
-    if (!currentUser) {
-      return c.json({ success: false, message: "Unauthorized: Active session required." }, 401);
-    }
-    const currentUserId = currentUser._id;
-
-    // 🛡️ Safe body parsing based on Content-Type header
-    const contentType = c.req.header("content-type") || "";
-    let body = {};
-
-    if (contentType.includes("application/json")) {
-      body = await c.req.json().catch(() => ({}));
-    } else if (
-      contentType.includes("multipart/form-data") ||
-      contentType.includes("application/x-www-form-urlencoded")
-    ) {
-      body = await c.req.parseBody({ all: true }).catch(() => ({}));
-    } else {
-      body = await c.req.json().catch(async () => await c.req.parseBody({ all: true }).catch(() => ({})));
-    }
-
-    const {
-      homeId,
-      homeName,
-      address,
-      pincode,
-      name,
-      mobile,
-      roomId,
-      roomName,
-      deviceId,
-      product,
-      brand,
-      warranty,
-      notificationsEnabled,
-      modelNumber,
-      serialNumber,
-      purchasedShopName,
-      shopWarranty
-    } = body;
-
-    // 2. Validate mandatory root anchor
-    if (!homeId) {
-      return c.json({
-        success: false,
-        message: "Missing required field: homeId is required to update details."
-      }, 400);
-    }
-
-    if (!ObjectId.isValid(homeId)) {
-      return c.json({
-        success: false,
-        message: "Invalid homeId format provided."
-      }, 400);
-    }
-
-    const cleanHomeIdStr = homeId.toString().trim();
-    const targetHomeId = new ObjectId(cleanHomeIdStr);
-
-    const result = await withDatabase(process.env.MONGODB_URI, async (db) => {
-      const homesCol = db.collection("homes");
-      const usersCol = db.collection("users");
-      const roomsCol = db.collection("rooms");
-      const devicesCol = db.collection("devices");
-
-      // 3. Verify Home exists AND ensure current user is an owner or member
-      const homeDoc = await homesCol.findOne({
-        _id: targetHomeId,
-        $or: [
-          { ownerId: currentUserId },
-          { members: currentUserId },
-          { memberIds: currentUserId }
-        ]
-      });
-
-      if (!homeDoc) {
-        throw new Error("HOME_FORBIDDEN_OR_NOT_FOUND");
-      }
-
-      const updatedSummary = {
-        homeUpdated: false,
-        userUpdated: false,
-        roomUpdated: false,
-        roomCreated: false,
-        createdRoomId: null,
-        deviceUpdated: false
-      };
-
-      const now = new Date().toISOString();
-
-      // 4. Update Home Details
-      if (homeName !== undefined || address !== undefined || pincode !== undefined) {
-        const homeUpdates = { updatedAt: now };
-        if (homeName !== undefined) homeUpdates.homeName = homeName.toString().trim();
-        if (address !== undefined) homeUpdates.address = address.toString().trim();
-        if (pincode !== undefined) homeUpdates.pincode = pincode.toString().trim();
-
-        const homeRes = await homesCol.updateOne(
-          { _id: targetHomeId },
-          { $set: homeUpdates }
-        );
-        updatedSummary.homeUpdated = homeRes.modifiedCount > 0;
-      }
-
-      // 5. Update User Profile Details (for the authenticated user)
-      if (name !== undefined || mobile !== undefined) {
-        const userUpdates = { updatedAt: now };
-
-        if (name !== undefined) {
-          const cleanName = name.toString().trim();
-          userUpdates.name = cleanName;
-          userUpdates["UserInfo.name"] = cleanName;
-        }
-
-        if (mobile !== undefined) {
-          const cleanMobile = mobile.toString().trim();
-          userUpdates.mobile = cleanMobile;
-          userUpdates["UserInfo.phoneNo"] = cleanMobile;
-        }
-
-        const userQuery = ObjectId.isValid(currentUserId)
-          ? { _id: new ObjectId(currentUserId) }
-          : { _id: currentUserId };
-
-        const userRes = await usersCol.updateOne(
-          userQuery,
-          { $set: userUpdates }
-        );
-        updatedSummary.userUpdated = userRes.modifiedCount > 0;
-      }
-
-      // 6. Room Management: Update existing OR Add new Room
-      if (roomName) {
-        const cleanRoomName = roomName.toString().trim();
-        let existingRoom = null;
-
-        if (roomId && ObjectId.isValid(roomId)) {
-          existingRoom = await roomsCol.findOne({
-            _id: new ObjectId(roomId.toString().trim()),
-            $or: [{ homeId: targetHomeId }, { homeId: cleanHomeIdStr }]
-          });
-        } else {
-          const escapedName = cleanRoomName.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&");
-          existingRoom = await roomsCol.findOne({
-            $or: [{ homeId: targetHomeId }, { homeId: cleanHomeIdStr }],
-            roomName: { $regex: new RegExp(`^${escapedName}$`, "i") }
-          });
-        }
-
-        if (existingRoom) {
-          const roomRes = await roomsCol.updateOne(
-            { _id: existingRoom._id },
-            { $set: { roomName: cleanRoomName, updatedAt: now } }
-          );
-          updatedSummary.roomUpdated = roomRes.modifiedCount > 0;
-        } else {
-          const insertRoomRes = await roomsCol.insertOne({
-            homeId: targetHomeId,
-            roomName: cleanRoomName,
-            createdAt: now,
-            updatedAt: now
-          });
-          updatedSummary.roomCreated = true;
-          updatedSummary.createdRoomId = insertRoomRes.insertedId.toString();
-        }
-      }
-
-      // 7. Update Device Details
-      if (
-        deviceId &&
-        (product !== undefined ||
-          brand !== undefined ||
-          warranty !== undefined ||
-          notificationsEnabled !== undefined ||
-          modelNumber !== undefined ||
-          serialNumber !== undefined ||
-          purchasedShopName !== undefined ||
-          shopWarranty !== undefined)
-      ) {
-        const deviceUpdates = { updatedAt: now };
-        if (product !== undefined) deviceUpdates.product = product ? product.toString().trim() : null;
-        if (brand !== undefined) deviceUpdates.brand = brand ? brand.toString().trim() : null;
-
-        // 🔄 When warranty date changes or is renewed, reset notified milestones
-        if (warranty !== undefined) {
-          deviceUpdates.warranty = warranty;
-          deviceUpdates.notifiedMilestones = [];
-        }
-
-        // 🔔 Handle notificationsEnabled toggle (boolean or string parsing)
-        if (notificationsEnabled !== undefined) {
-          deviceUpdates.notificationsEnabled =
-            typeof notificationsEnabled === "boolean"
-              ? notificationsEnabled
-              : String(notificationsEnabled).trim().toLowerCase() === "true";
-        }
-
-        // 📦 Hardware & Purchase Details
-        if (modelNumber !== undefined) {
-          deviceUpdates.modelNumber = modelNumber ? modelNumber.toString().trim() : null;
-        }
-        if (serialNumber !== undefined) {
-          deviceUpdates.serialNumber = serialNumber ? serialNumber.toString().trim() : null;
-        }
-        if (purchasedShopName !== undefined) {
-          deviceUpdates.purchasedShopName = purchasedShopName ? purchasedShopName.toString().trim() : null;
-        }
-        if (shopWarranty !== undefined) {
-          deviceUpdates.shopWarranty = shopWarranty ? shopWarranty.toString().trim() : null;
-        }
-
-        const cleanDeviceIdStr = deviceId.toString().trim();
-
-        const deviceFilter = {
-          $and: [
-            {
-              $or: [
-                { deviceId: cleanDeviceIdStr },
-                ...(ObjectId.isValid(cleanDeviceIdStr) ? [{ _id: new ObjectId(cleanDeviceIdStr) }] : [])
-              ]
-            },
-            {
-              $or: [
-                { homeId: targetHomeId },
-                { homeId: cleanHomeIdStr }
-              ]
-            }
-          ]
-        };
-
-        const deviceRes = await devicesCol.updateOne(
-          deviceFilter,
-          { $set: deviceUpdates }
-        );
-        updatedSummary.deviceUpdated = deviceRes.modifiedCount > 0;
-      }
-
-      return updatedSummary;
-    });
-
-    return c.json({
-      success: true,
-      message: "Entities updated successfully across collections.",
-      data: result
-    }, 200);
-
-  } catch (error) {
-    console.error("❌ Update Entity Controller Error:", error);
-
-    if (error.message === "HOME_FORBIDDEN_OR_NOT_FOUND") {
-      return c.json({
-        success: false,
-        message: "Home record not found or you do not have permission to modify it."
-      }, 403);
     }
 
     return c.json({ success: false, message: "Internal Server Error", error: error.message }, 500);
