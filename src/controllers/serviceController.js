@@ -180,9 +180,9 @@ export const getNearbyService = async (c) => {
       }
 
       // -------------------------------------------------------------
-      // TIER 2: OUT OF WARRANTY -> Zhini Providers (Pincode & Distance)
+      // TIER 2: OUT OF WARRANTY -> Zhini Verified Providers (Coordinate Radius + Trust Scoring)
       // -------------------------------------------------------------
-      console.log(`🔍 Checking Tier 2: Zhini Local Providers for "${product || brand}" [Pincode: ${pincode || 'None'}]`);
+      console.log(`🔍 Checking Tier 2: Zhini Local Providers for "${product || brand}" at (${lat}, ${lng})`);
 
       try {
         const providerCollection = db.collection('service-providers');
@@ -194,14 +194,15 @@ export const getNearbyService = async (c) => {
         // 1. Fetch active providers
         const activeProviders = await providerCollection.find({ status: 'active' }).toArray();
 
-        // 2. Filter providers by expertise tag and spatial distance
+        // 2. Filter by Expertise & Strict Coordinate Proximity
         const matchingProviders = activeProviders
           .map((provider) => {
+            // A. Expertise Match
             const providerTags = Array.isArray(provider.expertise)
               ? provider.expertise.map(normalizeTag)
               : [];
 
-            const isMatch = providerTags.some((tag) => {
+            const isTagMatch = providerTags.some((tag) => {
               if (targetProductTag && (tag.includes(targetProductTag) || targetProductTag.includes(tag))) {
                 return true;
               }
@@ -211,20 +212,33 @@ export const getNearbyService = async (c) => {
               return false;
             });
 
-            if (!isMatch) return null;
+            if (!isTagMatch) return null;
 
-            // Distance calculation against provider coordinates
-            let distanceKm = null;
-            if (provider.location?.coordinates) {
-              const [pLng, pLat] = provider.location.coordinates;
-              distanceKm = parseFloat(
-                calculateDistanceKm(lat, lng, pLat, pLng).toFixed(2)
-              );
-              const maxRadius = Number(provider.serviceRadiusKm) || 10;
-              if (distanceKm > maxRadius) return null; // Outside provider operational zone
-            } else if (pincode && provider.pincode !== pincode) {
-              // Fallback match by postal code if provider lacks coordinates
+            // B. Extract Provider Coordinates (GeoJSON [lng, lat] or top-level)
+            let pLat = null;
+            let pLng = null;
+
+            if (Array.isArray(provider.location?.coordinates) && provider.location.coordinates.length === 2) {
+              pLng = parseFloat(provider.location.coordinates[0]);
+              pLat = parseFloat(provider.location.coordinates[1]);
+            } else if (provider.latitude !== undefined && provider.longitude !== undefined) {
+              pLat = parseFloat(provider.latitude);
+              pLng = parseFloat(provider.longitude);
+            }
+
+            // Provider must have onboarding coordinates
+            if (pLat === null || isNaN(pLat) || pLng === null || isNaN(pLng)) {
               return null;
+            }
+
+            // C. Spatial Radius Check
+            const distanceKm = parseFloat(
+              calculateDistanceKm(lat, lng, pLat, pLng).toFixed(2)
+            );
+            const operationalRadius = Number(provider.serviceRadiusKm) || 15;
+
+            if (distanceKm > operationalRadius) {
+              return null; // Outside provider's operational range
             }
 
             return {
@@ -234,7 +248,7 @@ export const getNearbyService = async (c) => {
           })
           .filter(Boolean);
 
-        // 3. If matching providers exist, apply Wekan Social Proof & History Ranking
+        // 3. Social Proof, History, and Rating Enrichment
         if (matchingProviders.length > 0) {
           // A. User Personal Service History
           let userPastMobiles = new Set();
@@ -250,7 +264,7 @@ export const getNearbyService = async (c) => {
             });
           }
 
-          // B. Neighbor Service History (Strictly using Pincode for neighborhood ticket aggregation)
+          // B. Neighbor Service Volume (Wekan tickets matching pincode or city area)
           let neighborCountMap = {};
           if (pincode) {
             const neighborTickets = await wekanCollection.find({
@@ -265,11 +279,12 @@ export const getNearbyService = async (c) => {
             });
           }
 
-          // C. Map & Enrich Providers with trust scores
+          // C. Map Output Representation
           const rankedProviders = matchingProviders.map((provider) => {
             const pPhone = normalizePhone(provider.mobile);
             const hasUsedBefore = userPastMobiles.has(pPhone);
             const neighborServiceCount = neighborCountMap[pPhone] || 0;
+            const parsedRating = provider.rating ? parseFloat(provider.rating) : 4.5;
 
             return {
               id: provider._id,
@@ -278,8 +293,10 @@ export const getNearbyService = async (c) => {
               address: provider.address,
               pincode: provider.pincode,
               shopImageUrl: provider.shopImageUrl || null,
-              serviceRadiusKm: provider.serviceRadiusKm,
-              distanceKm: provider.distanceKm ?? null,
+              serviceRadiusKm: provider.serviceRadiusKm || 15,
+              distanceKm: provider.distanceKm,
+              rating: parsedRating,
+              totalReviews: provider.totalReviews || 0,
               gstNumber: provider.gstNumber || null,
               expertise: provider.expertise || [],
               hasUsedBefore,
@@ -287,18 +304,25 @@ export const getNearbyService = async (c) => {
             };
           });
 
-          // D. Multi-Factor Sort: Past Provider > Neighbor Service Trust > Distance (Ascending)
+          // D. Multi-Factor Ranking: Past Provider -> Neighbor Trust -> Rating -> Proximity
           rankedProviders.sort((a, b) => {
+            // 1. Used previously by the same user
             if (a.hasUsedBefore !== b.hasUsedBefore) {
               return b.hasUsedBefore ? 1 : -1;
             }
+            // 2. Neighbor service volume (local proof)
             if (b.neighborServiceCount !== a.neighborServiceCount) {
               return b.neighborServiceCount - a.neighborServiceCount;
             }
-            return (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity);
+            // 3. Provider rating
+            if (b.rating !== a.rating) {
+              return b.rating - a.rating;
+            }
+            // 4. Physical proximity (nearest first)
+            return a.distanceKm - b.distanceKm;
           });
 
-          console.log(`🎯 Tier 2 Hit: Found ${rankedProviders.length} Zhini Partner(s) ranked by history & proximity`);
+          console.log(`🎯 Tier 2 Hit: Found ${rankedProviders.length} Zhini Partner(s) within operational radius`);
 
           return {
             tier: 2,
@@ -497,26 +521,35 @@ export const normalizeTag = (tag) => {
 
 export const createServiceProvider = async (c) => {
   try {
-    const body = await c.req.parseBody();
+    let body = {};
+    try {
+      body = await c.req.parseBody({ all: true });
+    } catch (_) {
+      body = await c.req.json().catch(() => ({}));
+    }
 
     const name = body['name'];
     const mobile = body['mobile'];
-    const range = body['range'];
+    const range = body['range'] || body['serviceRadiusKm'];
     const expertiseInput = body['expertise'];
     const gstNumber = body['gstNumber'] || null;
     const address = body['address'];
     const pincode = body['pincode'] || null;
 
+    // Incoming coordinates from onboarding pin-drop
+    const rawLat = body['latitude'] ?? body['lat'] ?? null;
+    const rawLng = body['longitude'] ?? body['lng'] ?? null;
+
     if (!name || !mobile || !range || !expertiseInput || !address) {
       return c.json({
         success: false,
-        message: 'Missing required fields: name, mobile, range, or expertise.'
+        message: 'Missing required fields: name, mobile, range/serviceRadiusKm, expertise, or address.'
       }, 400);
     }
 
     const cleanMobile = mobile.trim();
 
-    // 🏷️ Tag Normalization: sanitize tags to lowercase slugs (e.g., ["ac_repair", "laptop", "plumbing"])
+    // 🏷️ Tag Normalization: sanitize tags to lowercase slugs (e.g., ["ac_repair", "laptop", "washing_machine"])
     let rawTags = [];
     if (typeof expertiseInput === 'string') {
       rawTags = expertiseInput.split(',').map((e) => e.trim());
@@ -533,38 +566,61 @@ export const createServiceProvider = async (c) => {
       }, 400);
     }
 
-    // Resolve GeoJSON Coordinates [longitude, latitude]
-    const coordinates = await getCoordinatesFromLocation(address, pincode);
+    // 📍 Coordinate Resolution: Pin drop coordinates take absolute precedence
+    let pLat = rawLat !== null && !isNaN(parseFloat(rawLat)) ? parseFloat(rawLat) : null;
+    let pLng = rawLng !== null && !isNaN(parseFloat(rawLng)) ? parseFloat(rawLng) : null;
+
+    if (pLat === null || pLng === null) {
+      // Fallback geocode only if coordinates were not supplied by the client
+      const fallbackCoords = await getCoordinatesFromLocation(address, pincode);
+      if (Array.isArray(fallbackCoords) && fallbackCoords.length === 2) {
+        pLng = parseFloat(fallbackCoords[0]);
+        pLat = parseFloat(fallbackCoords[1]);
+      }
+    }
+
+    if (pLat === null || pLng === null) {
+      return c.json({
+        success: false,
+        message: 'Accurate shop location (latitude/longitude or geocodable address) is required.'
+      }, 400);
+    }
 
     // Upload shop photo directly to Cloudflare R2 if provided
     let shopImageUrl = null;
     const photoFile = body['photo'];
-    if (photoFile && photoFile instanceof File) {
+    if (photoFile && (photoFile instanceof File || (typeof photoFile === 'object' && photoFile.name))) {
       shopImageUrl = await uploadToR2(photoFile, 'shop-images');
     }
 
-    // Provision Wekan Board
+    // Provision Wekan Board for Provider
     console.log(`📋 Provisioning Wekan Board for Provider: ${cleanMobile}`);
     const boardResult = await createProviderBoard(cleanMobile);
+
+    const now = new Date();
 
     const newProvider = {
       name: name.trim(),
       mobile: cleanMobile,
       expertise, // Standardized slugs array
-      serviceRadiusKm: Number(range) || 10,
+      serviceRadiusKm: Number(range) || 15,
       gstNumber: gstNumber ? gstNumber.trim() : null,
       shopImageUrl,
       status: 'active',
       address: address.trim(),
       pincode: pincode ? pincode.trim() : null,
+      rating: body['rating'] ? parseFloat(body['rating']) : 5.0, // Default baseline for new verified partners
+      totalReviews: 0,
+      latitude: pLat,
+      longitude: pLng,
       location: {
         type: 'Point',
-        coordinates: coordinates // [longitude, latitude]
+        coordinates: [pLng, pLat] // Standard GeoJSON: [longitude, latitude]
       },
       wekanBoardId: boardResult.boardId,
       wekanLists: boardResult.lists,
-      createdAt: new Date(),
-      updatedAt: new Date(),
+      createdAt: now,
+      updatedAt: now,
     };
 
     const result = await withDatabase(mongoUri, async (db) => {
@@ -575,7 +631,7 @@ export const createServiceProvider = async (c) => {
 
     return c.json({
       success: true,
-      message: 'Service Provider created successfully with standardized tags, Wekan board, and GeoJSON location.',
+      message: 'Service Provider created successfully with standardized tags, Wekan board, and verified coordinates.',
       data: {
         _id: result.insertedId,
         ...newProvider
